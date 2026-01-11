@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: collecta-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: collecta
+      POSTGRES_USER: collecta
+      POSTGRES_PASSWORD: collecta_pw
+      TZ: Asia/Seoul
+    ports:
+      - "5432:5432"
+    volumes:
+      - collecta_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U collecta -d collecta"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  collecta_pgdata:
