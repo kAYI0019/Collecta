@@ -6,6 +6,7 @@
 *.log
 .gradle/
 build/
+bin/
 out/
 !gradle-wrapper.jar
 
