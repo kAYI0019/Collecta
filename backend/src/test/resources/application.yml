@@ -1,0 +1,23 @@
+spring:
+  flyway:
+    enabled: false
+
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/collecta
+    username: collecta
+    password: collecta_pw
+
+elasticsearch:
+  host: localhost
+  port: 9200
+  scheme: http
+
+logging:
+  level:
+    org.hibernate.SQL: WARN
+
