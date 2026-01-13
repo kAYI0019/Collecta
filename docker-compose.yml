@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    image: postgres:16
     container_name: collecta-postgres
     restart: unless-stopped
     environment:
@@ -12,11 +12,56 @@ services:
       - "5432:5432"
     volumes:
       - collecta_pgdata:/var/lib/postgresql/data
+
+  elasticsearch:
+    build:
+      context: ./elasticsearch
+    container_name: collecta-es
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false # 운영시엔 보안 활성화 필요
+      - xpack.security.enrollment.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+      - TZ=Asia/Seoul
+    ports:
+      - "9200:9200"
+    volumes:
+      - collecta_esdata:/usr/share/elasticsearch/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U collecta -d collecta"]
+      test: ["CMD-SHELL", "curl -s http://localhost:9200 >/dev/null || exit 1"]
       interval: 5s
       timeout: 3s
-      retries: 20
+      retries: 30
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.19.0
+    container_name: collecta-kibana
+    restart: unless-stopped
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - TZ=Asia/Seoul
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+  worker:
+    build:
+      context: ./worker
+    container_name: collecta-worker
+    restart: unless-stopped
+    environment:
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      TZ: Asia/Seoul
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./data/files:/data/files
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
 
 volumes:
   collecta_pgdata:
+  collecta_esdata:
