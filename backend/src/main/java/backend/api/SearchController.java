@@ -1,7 +1,7 @@
 package backend.api;
 
 import backend.search.SearchService;
-import backend.search.dto.SearchResultDto;
+import backend.search.dto.GroupedSearchResultDto;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -17,9 +17,9 @@ public class SearchController {
     }
 
     @GetMapping
-    public List<SearchResultDto> search(
+    public List<GroupedSearchResultDto> search(
             @RequestParam(required = false) String q
     ) throws Exception {
-        return searchService.search(q);
+        return searchService.searchGrouped(q);
     }
 }
