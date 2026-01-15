@@ -5,12 +5,16 @@ spring:
   jpa:
     hibernate:
       ddl-auto: create-drop
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
     show-sql: false
 
   datasource:
     url: jdbc:postgresql://localhost:5432/collecta
     username: collecta
     password: collecta_pw
+    driver-class-name: org.postgresql.Driver
 
 elasticsearch:
   host: localhost
