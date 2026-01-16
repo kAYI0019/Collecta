@@ -6,6 +6,8 @@ import co.elastic.clients.elasticsearch.core.SearchResponse;
 import co.elastic.clients.elasticsearch.core.search.Hit;
 import backend.search.dto.GroupedSearchResultDto;
 import backend.search.dto.PagedResponse;
+import backend.search.dto.SearchResourceItemDto;
+import backend.search.internal.ResourceMeta;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
@@ -17,9 +19,11 @@ public class SearchService {
     private static final String INDEX = "collecta_chunks";
 
     private final ElasticsearchClient es;
+    private final ResourceMetaRepository resourceMetaRepository;
 
-    public SearchService(ElasticsearchClient es) {
+    public SearchService(ElasticsearchClient es, ResourceMetaRepository resourceMetaRepository) {
         this.es = es;
+        this.resourceMetaRepository = resourceMetaRepository;
     }
 
     public PagedResponse<GroupedSearchResultDto> searchGroupedPaged(
@@ -216,5 +220,63 @@ public class SearchService {
                     bestPageIndex
             );
         }
+    }
+
+    public PagedResponse<SearchResourceItemDto> searchResourceCards(
+            String q,
+            String resourceType,
+            String domain,
+            String status,
+            Boolean isPinned,
+            List<String> tags,
+            int page,
+            int pageSize,
+            String sort
+    ) throws Exception {
+        // 1) ES에서 그룹핑 + 페이징 메타까지 얻기 (지금 네 메서드 그대로 활용)
+        PagedResponse<GroupedSearchResultDto> grouped =
+                searchGroupedPaged(q, resourceType, domain, status, isPinned, tags, page, pageSize, sort);
+
+        // 2) 이번 페이지에 나온 resourceId들만 DB에서 메타 조회
+        List<Long> ids = grouped.items().stream()
+                .map(it -> Long.parseLong(it.resourceId()))
+                .toList();
+
+        Map<Long, ResourceMeta> metaMap = resourceMetaRepository.findByIds(ids);
+
+        // 3) ES 순서대로 합치기 (순서 유지 매우 중요)
+        List<SearchResourceItemDto> items = grouped.items().stream().map(g -> {
+            long id = Long.parseLong(g.resourceId());
+            ResourceMeta m = metaMap.get(id);
+
+            // 혹시 DB에 없으면(삭제됐는데 ES 남아있는 경우) 최소한의 fallback
+            if (m == null) {
+                return new SearchResourceItemDto(
+                        id, g.resourceType(),
+                        null, null, null, false, null,
+                        null, g.domain(),
+                        null, null, null, null,
+                        g.tags(),
+                        g.matchCount(), g.bestScore(), g.bestSnippet(), g.bestPageIndex()
+                );
+            }
+
+            return new SearchResourceItemDto(
+                    m.resourceId(), m.type(),
+                    m.title(), m.memo(), m.status(), m.isPinned(), m.createdAt(),
+                    m.url(), m.domain(),
+                    m.filePath(), m.mimeType(), m.fileSize(), m.sha256(),
+                    m.tags(), // tags는 DB 기준(정합성)
+                    g.matchCount(), g.bestScore(), g.bestSnippet(), g.bestPageIndex()
+            );
+        }).toList();
+
+        return new PagedResponse<>(
+                items,
+                grouped.page(),
+                grouped.pageSize(),
+                grouped.total(),
+                grouped.totalPages()
+        );
     }
 }
