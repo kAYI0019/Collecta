@@ -26,10 +26,21 @@ spring:
         dialect: org.hibernate.dialect.PostgreSQLDialect
     show-sql: true
 
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
 elasticsearch:
   host: localhost
   port: 9200
   scheme: http
+
+outbox:
+  publisher:
+    stream-key: collecta:outbox:resource
+    poll-interval-ms: 1000
+    batch-size: 100
 
 server:
   port: 8080
