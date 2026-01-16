@@ -53,6 +53,9 @@ services:
     restart: unless-stopped
     environment:
       ELASTICSEARCH_URL: http://elasticsearch:9200
+      REDIS_URL: redis://redis:6379/0
+      OUTBOX_STREAM_KEY: collecta:outbox:resource
+      OUTBOX_CONSUMER_GROUP: collecta-worker
       TZ: Asia/Seoul
     ports:
       - "8001:8001"
@@ -61,6 +64,16 @@ services:
     depends_on:
       elasticsearch:
         condition: service_healthy
+      redis:
+        condition: service_started
+
+  redis:
+    image: redis:7
+    container_name: collecta-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
 
 volumes:
   collecta_pgdata:
