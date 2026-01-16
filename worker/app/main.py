@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import json
+import os
+import threading
+import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
+from redis import Redis
+from redis.exceptions import RedisError
 
 from .chunking import chunk_text_by_chars, normalize_text
 from .extractors import (
@@ -18,6 +25,10 @@ from .es import bulk_index, get_es
 INDEX_NAME = "collecta_chunks"
 
 app = FastAPI(title="Collecta Worker", version="0.2.0")
+
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+OUTBOX_STREAM_KEY = os.environ.get("OUTBOX_STREAM_KEY", "collecta:outbox:resource")
+OUTBOX_CONSUMER_GROUP = os.environ.get("OUTBOX_CONSUMER_GROUP", "collecta-worker")
 
 
 # -----------------------------
@@ -89,6 +100,64 @@ def delete_by_resource_id(resource_id: int) -> None:
         raise
 
 
+def get_redis() -> Redis:
+    return Redis.from_url(REDIS_URL, decode_responses=True)
+
+
+def ensure_outbox_group(redis_client: Redis) -> None:
+    try:
+        redis_client.xgroup_create(
+            name=OUTBOX_STREAM_KEY,
+            groupname=OUTBOX_CONSUMER_GROUP,
+            id="0",
+            mkstream=True,
+        )
+    except RedisError as e:
+        if "BUSYGROUP" not in str(e):
+            raise
+
+
+def consume_outbox_events() -> None:
+    redis_client = get_redis()
+    ensure_outbox_group(redis_client)
+
+    consumer_name = os.environ.get(
+        "OUTBOX_CONSUMER_NAME",
+        f"worker-{uuid.uuid4().hex[:8]}",
+    )
+
+    while True:
+        try:
+            responses = redis_client.xreadgroup(
+                groupname=OUTBOX_CONSUMER_GROUP,
+                consumername=consumer_name,
+                streams={OUTBOX_STREAM_KEY: ">"},
+                count=10,
+                block=5000,
+            )
+            if not responses:
+                continue
+
+            for _, messages in responses:
+                for message_id, fields in messages:
+                    event_type = fields.get("event_type")
+                    payload_raw = fields.get("payload", "{}")
+
+                    if event_type == "RESOURCE_DELETED":
+                        payload = json.loads(payload_raw)
+                        resource_id = payload.get("resource_id")
+                        if resource_id is not None:
+                            delete_by_resource_id(int(resource_id))
+
+                    redis_client.xack(OUTBOX_STREAM_KEY, OUTBOX_CONSUMER_GROUP, message_id)
+        except RedisError as e:
+            print(f"[outbox] redis error: {e}")
+            time.sleep(1)
+        except Exception as e:
+            print(f"[outbox] consumer error: {e}")
+            time.sleep(1)
+
+
 def build_chunk_docs(
     *,
     resource_id: int,
@@ -134,7 +203,7 @@ def build_chunk_docs(
                     "page_index": c.page_index,
                     "position": c.position,
                     "chunk_text": c.text,
-                    # embedding은 다음 단계에서 추가 (dims=384)
+                    # embedding은 다음 단계에서 추가 (dims=1024)
                 }
             )
         pos += len(chunks)
@@ -145,6 +214,12 @@ def build_chunk_docs(
 # -----------------------------
 # Routes
 # -----------------------------
+@app.on_event("startup")
+def start_outbox_consumer() -> None:
+    thread = threading.Thread(target=consume_outbox_events, daemon=True)
+    thread.start()
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -287,7 +362,7 @@ def index_link(req: IndexLinkRequest):
         "page_index": None,
         "position": 0,
         "chunk_text": chunk_text,
-        # embedding은 다음 단계에서 추가
+        # embedding은 다음 단계에서 추가 (dims=1024)
     }
 
     try:
