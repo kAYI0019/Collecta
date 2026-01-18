@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from redis import Redis
 from redis.exceptions import RedisError
+from sentence_transformers import SentenceTransformer
 
 from .chunking import chunk_text_by_chars, normalize_text
 from .extractors import (
@@ -29,6 +30,9 @@ app = FastAPI(title="Collecta Worker", version="0.2.0")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 OUTBOX_STREAM_KEY = os.environ.get("OUTBOX_STREAM_KEY", "collecta:outbox:resource")
 OUTBOX_CONSUMER_GROUP = os.environ.get("OUTBOX_CONSUMER_GROUP", "collecta-worker")
+EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "dragonkue/BGE-m3-ko")
+EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "1024"))
+EMBEDDING_ENABLED = os.environ.get("EMBEDDING_ENABLED", "true").lower() == "true"
 
 
 # -----------------------------
@@ -40,8 +44,15 @@ class ChunkingOptions(BaseModel):
     overlap_chars: int = 200
 
 
+class EmbeddingOptions(BaseModel):
+    enabled: bool = True
+    model: Optional[str] = None
+    dim: Optional[int] = None
+
+
 class IndexOptions(BaseModel):
     chunking: ChunkingOptions = Field(default_factory=ChunkingOptions)
+    embedding: EmbeddingOptions = Field(default_factory=lambda: EmbeddingOptions(enabled=EMBEDDING_ENABLED))
 
 
 class DocumentInfo(BaseModel):
@@ -115,6 +126,32 @@ def ensure_outbox_group(redis_client: Redis) -> None:
     except RedisError as e:
         if "BUSYGROUP" not in str(e):
             raise
+
+
+_embedding_lock = threading.Lock()
+_embedding_model: Optional[SentenceTransformer] = None
+_embedding_model_name: Optional[str] = None
+
+
+def get_embedding_model(model_name: Optional[str]) -> SentenceTransformer:
+    global _embedding_model, _embedding_model_name
+    use_name = model_name or EMBEDDING_MODEL_NAME
+    with _embedding_lock:
+        if _embedding_model is None or _embedding_model_name != use_name:
+            _embedding_model = SentenceTransformer(use_name)
+            _embedding_model_name = use_name
+    return _embedding_model
+
+
+def embed_texts(texts: List[str], model_name: Optional[str], expected_dim: Optional[int]) -> List[List[float]]:
+    if not texts:
+        return []
+    model = get_embedding_model(model_name)
+    vectors = model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
+    out = [v.tolist() for v in vectors]
+    if expected_dim is not None and out and len(out[0]) != expected_dim:
+        raise ValueError(f"embedding dim mismatch: expected {expected_dim}, got {len(out[0])}")
+    return out
 
 
 def consume_outbox_events() -> None:
@@ -297,6 +334,25 @@ def index_document(req: IndexDocumentRequest):
 
     chars_extracted = sum(len(d.get("chunk_text", "")) for d in docs)
 
+    if req.options.embedding.enabled and docs:
+        try:
+            vectors = embed_texts(
+                [d.get("chunk_text", "") for d in docs],
+                req.options.embedding.model,
+                req.options.embedding.dim or EMBEDDING_DIM,
+            )
+            for d, v in zip(docs, vectors):
+                d["embedding"] = v
+        except Exception as e:
+            return {
+                "job_id": req.job_id,
+                "resource_id": req.resource_id,
+                "status": "failed",
+                "summary": {"chunk_count": 0, "chars_extracted": chars_extracted},
+                "warnings": warnings,
+                "errors": [{"code": "EMBEDDING_ERROR", "message": str(e)}],
+            }
+
     # 3) Re-index in Elasticsearch (delete -> bulk index)
     try:
         delete_by_resource_id(req.resource_id)
@@ -364,6 +420,25 @@ def index_link(req: IndexLinkRequest):
         "chunk_text": chunk_text,
         # embedding은 다음 단계에서 추가 (dims=1024)
     }
+
+    if req.options.embedding.enabled:
+        try:
+            vectors = embed_texts(
+                [chunk_text],
+                req.options.embedding.model,
+                req.options.embedding.dim or EMBEDDING_DIM,
+            )
+            if vectors:
+                doc["embedding"] = vectors[0]
+        except Exception as e:
+            return {
+                "job_id": req.job_id,
+                "resource_id": req.resource_id,
+                "status": "failed",
+                "summary": {"chunk_count": 0},
+                "warnings": warnings,
+                "errors": [{"code": "EMBEDDING_ERROR", "message": str(e)}],
+            }
 
     try:
         delete_by_resource_id(req.resource_id)
