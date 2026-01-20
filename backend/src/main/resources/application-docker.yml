@@ -1,0 +1,18 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://postgres:5432/collecta
+    username: collecta
+    password: collecta_pw
+
+  data:
+    redis:
+      host: redis
+      port: 6379
+
+elasticsearch:
+  host: elasticsearch
+  port: 9200
+  scheme: http
+
+worker:
+  base-url: http://worker:8001

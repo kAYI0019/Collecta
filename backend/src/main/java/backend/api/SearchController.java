@@ -25,6 +25,7 @@ public class SearchController {
             @RequestParam(required = false) String status,
             @RequestParam(required = false) Boolean isPinned,
             @RequestParam(required = false) String tags,
+            @RequestParam(required = false, defaultValue = "false") boolean semantic,
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "20") int pageSize,
             @RequestParam(defaultValue = "relevance") String sort
@@ -32,6 +33,12 @@ public class SearchController {
         List<String> tagList = (tags == null || tags.isBlank())
                 ? List.of()
                 : List.of(tags.split("\\s*,\\s*"));
+
+        if (semantic) {
+            return searchService.searchResourceCardsSemantic(
+                    q, resourceType, domain, status, isPinned, tagList, page, pageSize, sort
+            );
+        }
 
         return searchService.searchResourceCards(
                 q, resourceType, domain, status, isPinned, tagList, page, pageSize, sort

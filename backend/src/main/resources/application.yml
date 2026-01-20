@@ -36,6 +36,12 @@ elasticsearch:
   port: 9200
   scheme: http
 
+worker:
+  base-url: http://localhost:8001
+  embedding:
+    model: dragonkue/BGE-m3-ko
+    dim: 1024
+
 outbox:
   publisher:
     stream-key: collecta:outbox:resource

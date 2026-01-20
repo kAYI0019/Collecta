@@ -7,11 +7,13 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 from redis import Redis
 from redis.exceptions import RedisError
 from sentence_transformers import SentenceTransformer
+from fastapi.responses import JSONResponse
 
 from .chunking import chunk_text_by_chars, normalize_text
 from .extractors import (
@@ -23,7 +25,7 @@ from .extractors import (
 )
 from .es import bulk_index, get_es
 
-INDEX_NAME = "collecta_chunks"
+INDEX_NAME = "collecta-chunks"
 
 app = FastAPI(title="Collecta Worker", version="0.2.0")
 
@@ -53,6 +55,13 @@ class EmbeddingOptions(BaseModel):
 class IndexOptions(BaseModel):
     chunking: ChunkingOptions = Field(default_factory=ChunkingOptions)
     embedding: EmbeddingOptions = Field(default_factory=lambda: EmbeddingOptions(enabled=EMBEDDING_ENABLED))
+
+
+class EmbedRequest(BaseModel):
+    texts: Optional[List[str]] = None
+    text: Optional[str] = None
+    model: Optional[str] = None
+    dim: Optional[int] = None
 
 
 class DocumentInfo(BaseModel):
@@ -257,6 +266,13 @@ def start_outbox_consumer() -> None:
     thread.start()
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    body = await request.body()
+    print(f"[validation] path={request.url.path} body={body.decode('utf-8', errors='replace')}")
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -379,6 +395,26 @@ def index_document(req: IndexDocumentRequest):
         },
         "warnings": warnings,
         "errors": errors,
+    }
+
+
+@app.post("/embed")
+def embed(req: EmbedRequest):
+    texts = req.texts or []
+    if not texts and req.text:
+        texts = [req.text]
+    if not texts:
+        return {"embeddings": []}
+
+    vectors = embed_texts(
+        texts,
+        req.model,
+        req.dim or EMBEDDING_DIM,
+    )
+    return {
+        "embeddings": vectors,
+        "model": req.model or EMBEDDING_MODEL_NAME,
+        "dim": req.dim or EMBEDDING_DIM,
     }
 
 
