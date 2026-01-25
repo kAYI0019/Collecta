@@ -73,6 +73,7 @@ services:
     restart: unless-stopped
     environment:
       ELASTICSEARCH_URL: http://elasticsearch:9200
+      HF_HOME: /root/.cache/huggingface
       REDIS_URL: redis://redis:6379/0
       OUTBOX_STREAM_KEY: collecta:outbox:resource
       OUTBOX_CONSUMER_GROUP: collecta-worker
@@ -81,6 +82,7 @@ services:
       - "8001:8001"
     volumes:
       - ./data/files:/data/files
+      - ./data/hf-cache:/root/.cache/huggingface
     depends_on:
       elasticsearch:
         condition: service_healthy

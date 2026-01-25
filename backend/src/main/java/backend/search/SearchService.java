@@ -122,6 +122,61 @@ public class SearchService {
         return groupAndPage(hits, page, pageSize, sort);
     }
 
+    public PagedResponse<GroupedSearchResultDto> searchGroupedPagedHybrid(
+            String q,
+            String resourceType,
+            String domain,
+            String status,
+            Boolean isPinned,
+            List<String> tags,
+            int page,
+            int pageSize,
+            String sort
+    ) throws Exception {
+        if (q == null || q.isBlank()) {
+            return new PagedResponse<>(List.of(), clampNonNeg(page), clampPageSize(pageSize), 0, 0);
+        }
+
+        List<Double> queryVector = embeddingClient.embedOne(q);
+
+        page = clampNonNeg(page);
+        pageSize = clampPageSize(pageSize);
+
+        int fetchSize = Math.max(300, pageSize * 30);
+
+        Query keywordQuery = Query.of(qb -> qb.bool(b -> {
+            b.must(m -> m.match(mm -> mm.field("chunk_text").query(q)));
+            applyFilters(b, resourceType, domain, status, isPinned, tags);
+            return b;
+        }));
+
+        Query hybridQuery = Query.of(qb -> qb.functionScore(fs -> fs
+                .query(keywordQuery)
+                .functions(f -> f.scriptScore(ss -> ss
+                                .script(sc -> sc
+                                        .source("cosineSimilarity(params.query_vector, 'embedding') + 1.0")
+                                        .params("query_vector", JsonData.of(queryVector))
+                                )
+                        )
+                        .weight(0.4)
+                )
+                .scoreMode(co.elastic.clients.elasticsearch._types.query_dsl.FunctionScoreMode.Sum)
+                .boostMode(co.elastic.clients.elasticsearch._types.query_dsl.FunctionBoostMode.Sum)
+        ));
+
+        SearchRequest request = SearchRequest.of(s -> s
+                .index(INDEX)
+                .size(fetchSize)
+                .query(hybridQuery)
+                .highlight(h -> h.fields("chunk_text", f -> f))
+        );
+
+        SearchResponse<Map> response = es.search(request, Map.class);
+        List<Hit<Map>> hits = response.hits().hits();
+
+        return groupAndPage(hits, page, pageSize, sort);
+    }
+
     // -------- Helpers --------
     private static int clampNonNeg(int v) { return Math.max(0, v); }
     private static int clampPageSize(int v) { if (v <= 0) return 20; return Math.min(v, 100); }
@@ -362,6 +417,60 @@ public class SearchService {
     ) throws Exception {
         PagedResponse<GroupedSearchResultDto> grouped =
                 searchGroupedPagedVector(q, resourceType, domain, status, isPinned, tags, page, pageSize, sort);
+
+        List<Long> ids = grouped.items().stream()
+                .map(it -> Long.parseLong(it.resourceId()))
+                .toList();
+
+        Map<Long, ResourceMeta> metaMap = resourceMetaRepository.findByIds(ids);
+
+        List<SearchResourceItemDto> items = grouped.items().stream().map(g -> {
+            long id = Long.parseLong(g.resourceId());
+            ResourceMeta m = metaMap.get(id);
+
+            if (m == null) {
+                return new SearchResourceItemDto(
+                        id, g.resourceType(),
+                        null, null, null, false, null,
+                        null, g.domain(),
+                        null, null, null, null,
+                        g.tags(),
+                        g.matchCount(), g.bestScore(), g.bestSnippet(), g.bestPageIndex()
+                );
+            }
+
+            return new SearchResourceItemDto(
+                    m.resourceId(), m.type(),
+                    m.title(), m.memo(), m.status(), m.isPinned(), m.createdAt(),
+                    m.url(), m.domain(),
+                    m.filePath(), m.mimeType(), m.fileSize(), m.sha256(),
+                    m.tags(),
+                    g.matchCount(), g.bestScore(), g.bestSnippet(), g.bestPageIndex()
+            );
+        }).toList();
+
+        return new PagedResponse<>(
+                items,
+                grouped.page(),
+                grouped.pageSize(),
+                grouped.total(),
+                grouped.totalPages()
+        );
+    }
+
+    public PagedResponse<SearchResourceItemDto> searchResourceCardsHybrid(
+            String q,
+            String resourceType,
+            String domain,
+            String status,
+            Boolean isPinned,
+            List<String> tags,
+            int page,
+            int pageSize,
+            String sort
+    ) throws Exception {
+        PagedResponse<GroupedSearchResultDto> grouped =
+                searchGroupedPagedHybrid(q, resourceType, domain, status, isPinned, tags, page, pageSize, sort);
 
         List<Long> ids = grouped.items().stream()
                 .map(it -> Long.parseLong(it.resourceId()))

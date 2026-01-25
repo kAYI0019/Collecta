@@ -7,13 +7,11 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Request
-from fastapi.exceptions import RequestValidationError
+from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from redis import Redis
 from redis.exceptions import RedisError
 from sentence_transformers import SentenceTransformer
-from fastapi.responses import JSONResponse
 
 from .chunking import chunk_text_by_chars, normalize_text
 from .extractors import (
@@ -264,13 +262,6 @@ def build_chunk_docs(
 def start_outbox_consumer() -> None:
     thread = threading.Thread(target=consume_outbox_events, daemon=True)
     thread.start()
-
-
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    body = await request.body()
-    print(f"[validation] path={request.url.path} body={body.decode('utf-8', errors='replace')}")
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
 @app.get("/health")
