@@ -5,6 +5,8 @@ import os
 import threading
 import time
 import uuid
+import urllib.request
+import urllib.error
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI
@@ -33,6 +35,8 @@ OUTBOX_CONSUMER_GROUP = os.environ.get("OUTBOX_CONSUMER_GROUP", "collecta-worker
 EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "dragonkue/BGE-m3-ko")
 EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "1024"))
 EMBEDDING_ENABLED = os.environ.get("EMBEDDING_ENABLED", "true").lower() == "true"
+EMBEDDING_BATCH_SIZE = int(os.environ.get("EMBEDDING_BATCH_SIZE", "16"))
+BACKEND_BASE_URL = os.environ.get("BACKEND_BASE_URL", "http://localhost:8080")
 
 
 # -----------------------------
@@ -150,15 +154,89 @@ def get_embedding_model(model_name: Optional[str]) -> SentenceTransformer:
     return _embedding_model
 
 
-def embed_texts(texts: List[str], model_name: Optional[str], expected_dim: Optional[int]) -> List[List[float]]:
+def embed_texts(
+    texts: List[str],
+    model_name: Optional[str],
+    expected_dim: Optional[int],
+    progress_cb: Optional[callable] = None
+) -> List[List[float]]:
     if not texts:
         return []
     model = get_embedding_model(model_name)
-    vectors = model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
-    out = [v.tolist() for v in vectors]
-    if expected_dim is not None and out and len(out[0]) != expected_dim:
-        raise ValueError(f"embedding dim mismatch: expected {expected_dim}, got {len(out[0])}")
+    batch_size = max(1, EMBEDDING_BATCH_SIZE)
+    out: List[List[float]] = []
+    total = len(texts)
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        vectors = model.encode(batch, convert_to_numpy=True, show_progress_bar=False)
+        batch_out = [v.tolist() for v in vectors]
+        if expected_dim is not None and batch_out and len(batch_out[0]) != expected_dim:
+            raise ValueError(f"embedding dim mismatch: expected {expected_dim}, got {len(batch_out[0])}")
+        out.extend(batch_out)
+        if progress_cb:
+            progress_cb(min(i + batch_size, total), total)
     return out
+
+
+def update_ingest_status(resource_id: int, status: str, error_message: Optional[str] = None) -> None:
+    payload = {
+        "resourceId": resource_id,
+        "status": status,
+        "errorMessage": error_message,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    url = f"{BACKEND_BASE_URL}/api/ingest/status"
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+    except urllib.error.URLError as e:
+        print(f"[status] failed to update ingest status: {e}")
+
+
+def update_ingest_progress(
+    resource_id: int,
+    stage: str,
+    total_units: Optional[int],
+    processed_units: Optional[int]
+) -> None:
+    payload = {
+        "resourceId": resource_id,
+        "stage": stage,
+        "totalUnits": total_units,
+        "processedUnits": processed_units,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    url = f"{BACKEND_BASE_URL}/api/ingest/progress"
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+    except urllib.error.URLError as e:
+        print(f"[progress] failed to update ingest progress: {e}")
+
+
+def make_progress_reporter(resource_id: int, stage: str):
+    last_sent = 0.0
+
+    def report(processed: int, total: int):
+        nonlocal last_sent
+        now = time.time()
+        if processed == total or processed == 1 or now - last_sent >= 1.0:
+            update_ingest_progress(resource_id, stage, total, processed)
+            last_sent = now
+
+    return report
 
 
 def consume_outbox_events() -> None:
@@ -192,6 +270,78 @@ def consume_outbox_events() -> None:
                         resource_id = payload.get("resource_id")
                         if resource_id is not None:
                             delete_by_resource_id(int(resource_id))
+                    elif event_type == "RESOURCE_INDEX":
+                        payload = json.loads(payload_raw)
+                        resource_type = payload.get("resource_type")
+                        resource_id = payload.get("resource_id")
+                        if resource_id is None or resource_type is None:
+                            redis_client.xack(OUTBOX_STREAM_KEY, OUTBOX_CONSUMER_GROUP, message_id)
+                            continue
+
+                        job_id = payload.get("job_id") or f"outbox-{fields.get('event_id', message_id)}"
+                        tags = payload.get("tags") or []
+                        status = payload.get("status") or "todo"
+                        is_pinned = bool(payload.get("is_pinned", False))
+                        created_at = payload.get("created_at")
+                        domain = payload.get("domain")
+
+                        update_ingest_status(int(resource_id), "processing", None)
+
+                        try:
+                            if resource_type == "document":
+                                doc = payload.get("document") or {}
+                                req = IndexDocumentRequest(
+                                    job_id=job_id,
+                                    resource_id=int(resource_id),
+                                    resource_type="document",
+                                    domain=domain,
+                                    tags=tags,
+                                    status=status,
+                                    is_pinned=is_pinned,
+                                    created_at=created_at,
+                                    document=DocumentInfo(
+                                        file_path=doc.get("file_path"),
+                                        mime_type=doc.get("mime_type"),
+                                        file_name=doc.get("file_name"),
+                                    ),
+                                    options=IndexOptions(),
+                                )
+                                result = process_document(req, progress_enabled=True)
+                            elif resource_type == "link":
+                                link = payload.get("link") or {}
+                                req = IndexLinkRequest(
+                                    job_id=job_id,
+                                    resource_id=int(resource_id),
+                                    resource_type="link",
+                                    domain=domain,
+                                    tags=tags,
+                                    status=status,
+                                    is_pinned=is_pinned,
+                                    created_at=created_at,
+                                    link=link,
+                                    options=IndexOptions(),
+                                )
+                                result = process_link(req, progress_enabled=True)
+                            else:
+                                result = {"status": "failed", "errors": [{"message": "unknown resource_type"}]}
+
+                            if result.get("status") in ("completed", "completed_with_warnings"):
+                                summary = result.get("summary") or {}
+                                chunk_count = summary.get("chunk_count")
+                                update_ingest_progress(
+                                    int(resource_id),
+                                    "done",
+                                    chunk_count,
+                                    chunk_count,
+                                )
+                                update_ingest_status(int(resource_id), "done", None)
+                            else:
+                                err = None
+                                if isinstance(result.get("errors"), list) and result["errors"]:
+                                    err = result["errors"][0].get("message")
+                                update_ingest_status(int(resource_id), "failed", err)
+                        except Exception as e:
+                            update_ingest_status(int(resource_id), "failed", str(e))
 
                     redis_client.xack(OUTBOX_STREAM_KEY, OUTBOX_CONSUMER_GROUP, message_id)
         except RedisError as e:
@@ -269,8 +419,7 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/index/document")
-def index_document(req: IndexDocumentRequest):
+def process_document(req: IndexDocumentRequest, progress_enabled: bool = False):
     fp = req.document.file_path
     mime = req.document.mime_type or detect_mime_from_ext(fp) or ""
 
@@ -282,7 +431,12 @@ def index_document(req: IndexDocumentRequest):
         segments: List[Tuple[Optional[int], str]] = []
 
         if mime == "application/pdf":
-            pages, w = extract_pdf_pages(fp)
+            progress_cb = None
+            if progress_enabled:
+                def progress_cb(current: int, total: int):
+                    update_ingest_progress(int(req.resource_id), "extracting", total, current)
+
+            pages, w = extract_pdf_pages(fp, on_progress=progress_cb)
             warnings.extend(w)
             segments = [(i, t) for i, t in enumerate(pages)]
             source_kind = "document_text"
@@ -292,18 +446,24 @@ def index_document(req: IndexDocumentRequest):
             warnings.extend(w)
             segments = [(None, text)]
             source_kind = "document_text"
+            if progress_enabled:
+                update_ingest_progress(int(req.resource_id), "extracting", 1, 1)
 
         elif "presentationml.presentation" in mime:  # PPTX
             slides, w = extract_pptx_slides(fp)
             warnings.extend(w)
             segments = [(i, t) for i, t in enumerate(slides)]
             source_kind = "document_text"
+            if progress_enabled:
+                update_ingest_progress(int(req.resource_id), "extracting", len(slides), len(slides))
 
         elif mime in ("text/plain", "text/markdown") or fp.lower().endswith((".txt", ".md")):
             text, w = extract_txt(fp)
             warnings.extend(w)
             segments = [(None, text)]
             source_kind = "document_text"
+            if progress_enabled:
+                update_ingest_progress(int(req.resource_id), "extracting", 1, 1)
 
         else:
             return {
@@ -342,11 +502,15 @@ def index_document(req: IndexDocumentRequest):
     chars_extracted = sum(len(d.get("chunk_text", "")) for d in docs)
 
     if req.options.embedding.enabled and docs:
+        if progress_enabled:
+            update_ingest_progress(int(req.resource_id), "embedding", len(docs), 0)
         try:
             vectors = embed_texts(
                 [d.get("chunk_text", "") for d in docs],
                 req.options.embedding.model,
                 req.options.embedding.dim or EMBEDDING_DIM,
+                (lambda processed, total: update_ingest_progress(int(req.resource_id), "embedding", total, processed))
+                if progress_enabled else None,
             )
             for d, v in zip(docs, vectors):
                 d["embedding"] = v
@@ -362,6 +526,8 @@ def index_document(req: IndexDocumentRequest):
 
     # 3) Re-index in Elasticsearch (delete -> bulk index)
     try:
+        if progress_enabled:
+            update_ingest_progress(int(req.resource_id), "indexing", len(docs), len(docs))
         delete_by_resource_id(req.resource_id)
         bulk_index(INDEX_NAME, docs)
     except Exception as e:
@@ -389,6 +555,11 @@ def index_document(req: IndexDocumentRequest):
     }
 
 
+@app.post("/index/document")
+def index_document(req: IndexDocumentRequest):
+    return process_document(req, progress_enabled=False)
+
+
 @app.post("/embed")
 def embed(req: EmbedRequest):
     texts = req.texts or []
@@ -409,8 +580,7 @@ def embed(req: EmbedRequest):
     }
 
 
-@app.post("/index/link")
-def index_link(req: IndexLinkRequest):
+def process_link(req: IndexLinkRequest, progress_enabled: bool = False):
     warnings: List[str] = []
     errors: List[Dict[str, str]] = []
 
@@ -449,11 +619,15 @@ def index_link(req: IndexLinkRequest):
     }
 
     if req.options.embedding.enabled:
+        if progress_enabled:
+            update_ingest_progress(int(req.resource_id), "embedding", 1, 0)
         try:
             vectors = embed_texts(
                 [chunk_text],
                 req.options.embedding.model,
                 req.options.embedding.dim or EMBEDDING_DIM,
+                (lambda processed, total: update_ingest_progress(int(req.resource_id), "embedding", total, processed))
+                if progress_enabled else None,
             )
             if vectors:
                 doc["embedding"] = vectors[0]
@@ -468,6 +642,8 @@ def index_link(req: IndexLinkRequest):
             }
 
     try:
+        if progress_enabled:
+            update_ingest_progress(int(req.resource_id), "indexing", 1, 1)
         delete_by_resource_id(req.resource_id)
         bulk_index(INDEX_NAME, [doc])
     except Exception as e:
@@ -488,3 +664,8 @@ def index_link(req: IndexLinkRequest):
         "warnings": warnings,
         "errors": errors,
     }
+
+
+@app.post("/index/link")
+def index_link(req: IndexLinkRequest):
+    return process_link(req, progress_enabled=False)

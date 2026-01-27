@@ -9,6 +9,11 @@ spring:
       host: redis
       port: 6379
 
+  servlet:
+    multipart:
+      max-file-size: 100MB
+      max-request-size: 100MB
+
 elasticsearch:
   host: elasticsearch
   port: 9200
@@ -16,3 +21,6 @@ elasticsearch:
 
 worker:
   base-url: http://worker:8001
+
+storage:
+  base-path: /data/uploads

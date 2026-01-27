@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Callable
 import os
 
 import pdfplumber
@@ -19,12 +19,18 @@ def detect_mime_from_ext(file_path: str) -> Optional[str]:
     }.get(ext)
 
 
-def extract_pdf_pages(file_path: str) -> Tuple[List[str], List[str]]:
+def extract_pdf_pages(
+    file_path: str,
+    on_progress: Optional[Callable[[int, int], None]] = None
+) -> Tuple[List[str], List[str]]:
     warnings: List[str] = []
     pages: List[str] = []
     with pdfplumber.open(file_path) as pdf:
-        for p in pdf.pages:
+        total = len(pdf.pages)
+        for idx, p in enumerate(pdf.pages, start=1):
             pages.append(p.extract_text() or "")
+            if on_progress:
+                on_progress(idx, total)
     if len(pages) >= 3 and sum(len(p.strip()) for p in pages) < 800:
         warnings.append("low_text_density")
         warnings.append("possible_scanned_pdf")

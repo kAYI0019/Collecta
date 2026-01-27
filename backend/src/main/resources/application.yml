@@ -26,6 +26,11 @@ spring:
         dialect: org.hibernate.dialect.PostgreSQLDialect
     show-sql: true
 
+  servlet:
+    multipart:
+      max-file-size: 100MB
+      max-request-size: 100MB
+
   data:
     redis:
       host: localhost
@@ -41,6 +46,9 @@ worker:
   embedding:
     model: dragonkue/BGE-m3-ko
     dim: 1024
+
+storage:
+  base-path: data/uploads
 
 outbox:
   publisher:
