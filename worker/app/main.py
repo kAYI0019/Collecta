@@ -248,8 +248,108 @@ def consume_outbox_events() -> None:
         f"worker-{uuid.uuid4().hex[:8]}",
     )
 
+    def handle_message(message_id: str, fields: Dict[str, str]):
+        event_type = fields.get("event_type")
+        payload_raw = fields.get("payload", "{}")
+
+        if event_type == "RESOURCE_DELETED":
+            payload = json.loads(payload_raw)
+            resource_id = payload.get("resource_id")
+            if resource_id is not None:
+                delete_by_resource_id(int(resource_id))
+            return
+
+        if event_type != "RESOURCE_INDEX":
+            return
+
+        payload = json.loads(payload_raw)
+        resource_type = payload.get("resource_type")
+        resource_id = payload.get("resource_id")
+        if resource_id is None or resource_type is None:
+            return
+
+        job_id = payload.get("job_id") or f"outbox-{fields.get('event_id', message_id)}"
+        tags = payload.get("tags") or []
+        status = payload.get("status") or "todo"
+        is_pinned = bool(payload.get("is_pinned", False))
+        created_at = payload.get("created_at")
+        domain = payload.get("domain")
+
+        update_ingest_status(int(resource_id), "processing", None)
+
+        try:
+            if resource_type == "document":
+                doc = payload.get("document") or {}
+                req = IndexDocumentRequest(
+                    job_id=job_id,
+                    resource_id=int(resource_id),
+                    resource_type="document",
+                    domain=domain,
+                    tags=tags,
+                    status=status,
+                    is_pinned=is_pinned,
+                    created_at=created_at,
+                    document=DocumentInfo(
+                        file_path=doc.get("file_path"),
+                        mime_type=doc.get("mime_type"),
+                        file_name=doc.get("file_name"),
+                    ),
+                    options=IndexOptions(),
+                )
+                result = process_document(req, progress_enabled=True)
+            elif resource_type == "link":
+                link = payload.get("link") or {}
+                req = IndexLinkRequest(
+                    job_id=job_id,
+                    resource_id=int(resource_id),
+                    resource_type="link",
+                    domain=domain,
+                    tags=tags,
+                    status=status,
+                    is_pinned=is_pinned,
+                    created_at=created_at,
+                    link=link,
+                    options=IndexOptions(),
+                )
+                result = process_link(req, progress_enabled=True)
+            else:
+                result = {"status": "failed", "errors": [{"message": "unknown resource_type"}]}
+
+            if result.get("status") in ("completed", "completed_with_warnings"):
+                summary = result.get("summary") or {}
+                chunk_count = summary.get("chunk_count")
+                update_ingest_progress(
+                    int(resource_id),
+                    "done",
+                    chunk_count,
+                    chunk_count,
+                )
+                update_ingest_status(int(resource_id), "done", None)
+            else:
+                err = None
+                if isinstance(result.get("errors"), list) and result["errors"]:
+                    err = result["errors"][0].get("message")
+                update_ingest_status(int(resource_id), "failed", err)
+        except Exception as e:
+            update_ingest_status(int(resource_id), "failed", str(e))
+
     while True:
         try:
+            claimed = redis_client.xautoclaim(
+                name=OUTBOX_STREAM_KEY,
+                groupname=OUTBOX_CONSUMER_GROUP,
+                consumername=consumer_name,
+                min_idle_time=60000,
+                start_id="0-0",
+                count=10,
+            )
+            claimed_messages = claimed[1] if claimed else []
+            if claimed_messages:
+                for message_id, fields in claimed_messages:
+                    handle_message(message_id, fields)
+                    redis_client.xack(OUTBOX_STREAM_KEY, OUTBOX_CONSUMER_GROUP, message_id)
+                continue
+
             responses = redis_client.xreadgroup(
                 groupname=OUTBOX_CONSUMER_GROUP,
                 consumername=consumer_name,
@@ -262,87 +362,7 @@ def consume_outbox_events() -> None:
 
             for _, messages in responses:
                 for message_id, fields in messages:
-                    event_type = fields.get("event_type")
-                    payload_raw = fields.get("payload", "{}")
-
-                    if event_type == "RESOURCE_DELETED":
-                        payload = json.loads(payload_raw)
-                        resource_id = payload.get("resource_id")
-                        if resource_id is not None:
-                            delete_by_resource_id(int(resource_id))
-                    elif event_type == "RESOURCE_INDEX":
-                        payload = json.loads(payload_raw)
-                        resource_type = payload.get("resource_type")
-                        resource_id = payload.get("resource_id")
-                        if resource_id is None or resource_type is None:
-                            redis_client.xack(OUTBOX_STREAM_KEY, OUTBOX_CONSUMER_GROUP, message_id)
-                            continue
-
-                        job_id = payload.get("job_id") or f"outbox-{fields.get('event_id', message_id)}"
-                        tags = payload.get("tags") or []
-                        status = payload.get("status") or "todo"
-                        is_pinned = bool(payload.get("is_pinned", False))
-                        created_at = payload.get("created_at")
-                        domain = payload.get("domain")
-
-                        update_ingest_status(int(resource_id), "processing", None)
-
-                        try:
-                            if resource_type == "document":
-                                doc = payload.get("document") or {}
-                                req = IndexDocumentRequest(
-                                    job_id=job_id,
-                                    resource_id=int(resource_id),
-                                    resource_type="document",
-                                    domain=domain,
-                                    tags=tags,
-                                    status=status,
-                                    is_pinned=is_pinned,
-                                    created_at=created_at,
-                                    document=DocumentInfo(
-                                        file_path=doc.get("file_path"),
-                                        mime_type=doc.get("mime_type"),
-                                        file_name=doc.get("file_name"),
-                                    ),
-                                    options=IndexOptions(),
-                                )
-                                result = process_document(req, progress_enabled=True)
-                            elif resource_type == "link":
-                                link = payload.get("link") or {}
-                                req = IndexLinkRequest(
-                                    job_id=job_id,
-                                    resource_id=int(resource_id),
-                                    resource_type="link",
-                                    domain=domain,
-                                    tags=tags,
-                                    status=status,
-                                    is_pinned=is_pinned,
-                                    created_at=created_at,
-                                    link=link,
-                                    options=IndexOptions(),
-                                )
-                                result = process_link(req, progress_enabled=True)
-                            else:
-                                result = {"status": "failed", "errors": [{"message": "unknown resource_type"}]}
-
-                            if result.get("status") in ("completed", "completed_with_warnings"):
-                                summary = result.get("summary") or {}
-                                chunk_count = summary.get("chunk_count")
-                                update_ingest_progress(
-                                    int(resource_id),
-                                    "done",
-                                    chunk_count,
-                                    chunk_count,
-                                )
-                                update_ingest_status(int(resource_id), "done", None)
-                            else:
-                                err = None
-                                if isinstance(result.get("errors"), list) and result["errors"]:
-                                    err = result["errors"][0].get("message")
-                                update_ingest_status(int(resource_id), "failed", err)
-                        except Exception as e:
-                            update_ingest_status(int(resource_id), "failed", str(e))
-
+                    handle_message(message_id, fields)
                     redis_client.xack(OUTBOX_STREAM_KEY, OUTBOX_CONSUMER_GROUP, message_id)
         except RedisError as e:
             print(f"[outbox] redis error: {e}")

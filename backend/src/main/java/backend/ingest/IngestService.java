@@ -9,6 +9,7 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -46,43 +47,68 @@ public class IngestService {
             boolean isPinned,
             List<String> tags
     ) {
-        String safeTitle = (title == null || title.isBlank()) ? file.getOriginalFilename() : title;
+        String originalFilename = file.getOriginalFilename();
+        String safeTitle = (title == null || title.isBlank())
+                ? (originalFilename == null || originalFilename.isBlank() ? "untitled" : originalFilename)
+                : title;
         String safeMemo = (memo == null ? "" : memo);
         String safeStatus = (status == null || status.isBlank()) ? "todo" : status;
 
-        ResourceRow resource = insertResource("document", safeTitle, safeMemo, safeStatus, isPinned);
-        insertIngestJob(resource.id(), "document", safeTitle);
-
         Path baseDir = Path.of(basePath).toAbsolutePath().normalize();
-        Path resourceDir = baseDir.resolve(Long.toString(resource.id()));
+        Path tmpDir = baseDir.resolve("tmp");
         try {
-            Files.createDirectories(resourceDir);
+            Files.createDirectories(tmpDir);
         } catch (IOException e) {
-            throw new IllegalStateException("failed to create resource directory", e);
+            throw new IllegalStateException("failed to create temp directory", e);
         }
 
-        String ext = fileExtension(file.getOriginalFilename());
-        Path dest = resourceDir.resolve("original" + ext);
-
-        try (InputStream in = file.getInputStream()) {
-            Files.copy(in, dest, StandardCopyOption.REPLACE_EXISTING);
+        String ext = fileExtension(originalFilename);
+        Path tmp;
+        try {
+            tmp = Files.createTempFile(tmpDir, "upload-", ext);
         } catch (IOException e) {
-            throw new IllegalStateException("failed to save file", e);
+            throw new IllegalStateException("failed to create temp file", e);
         }
 
-        long size;
+        SavedFile saved;
         try {
-            size = Files.size(dest);
-        } catch (IOException e) {
-            throw new IllegalStateException("failed to read file size", e);
+            saved = saveAndDigest(file, tmp);
+        } catch (Exception e) {
+            tryDelete(tmp);
+            throw e;
+        }
+
+        // 1) Dedupe by content hash (idempotent upload)
+        Long existingResourceId = findExistingDocumentResourceId(saved.sha256());
+        if (existingResourceId != null) {
+            tryDelete(tmp);
+            return existingResourceId;
         }
 
         String mimeType = file.getContentType();
         if (mimeType == null || mimeType.isBlank()) {
-            mimeType = probeMimeType(dest);
+            mimeType = probeMimeType(tmp);
         }
 
-        String sha256 = sha256Hex(dest);
+        // 2) Persist new resource + move temp file into place
+        ResourceRow resource = insertResource("document", safeTitle, safeMemo, safeStatus, isPinned);
+        insertIngestJob(resource.id(), "document", safeTitle);
+
+        Path resourceDir = baseDir.resolve(Long.toString(resource.id()));
+        try {
+            Files.createDirectories(resourceDir);
+        } catch (IOException e) {
+            tryDelete(tmp);
+            throw new IllegalStateException("failed to create resource directory", e);
+        }
+
+        Path dest = resourceDir.resolve("original" + ext);
+        try {
+            Files.move(tmp, dest, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            tryDelete(tmp);
+            throw new IllegalStateException("failed to move file into place", e);
+        }
 
         jdbc.update(
                 """
@@ -92,15 +118,15 @@ public class IngestService {
                 resource.id(),
                 dest.toString(),
                 mimeType,
-                size,
-                sha256
+                saved.size(),
+                saved.sha256()
         );
 
         attachTags(resource.id(), tags);
         publishIndexEvent(resource, "document", null, tags, safeStatus, isPinned, Map.of(
                 "file_path", dest.toString(),
                 "mime_type", mimeType,
-                "file_name", file.getOriginalFilename()
+                "file_name", originalFilename
         ), null);
 
         return resource.id();
@@ -261,6 +287,52 @@ public class IngestService {
         }
     }
 
+    private Long findExistingDocumentResourceId(String sha256) {
+        if (sha256 == null || sha256.isBlank()) return null;
+        List<Long> ids = jdbc.query(
+                """
+                SELECT resource_id
+                FROM documents
+                WHERE sha256 = ?
+                ORDER BY resource_id
+                LIMIT 1
+                """,
+                (rs, rowNum) -> rs.getLong("resource_id"),
+                sha256
+        );
+        return ids.isEmpty() ? null : ids.get(0);
+    }
+
+    private static SavedFile saveAndDigest(MultipartFile file, Path dest) {
+        MessageDigest digest;
+        try {
+            digest = MessageDigest.getInstance("SHA-256");
+        } catch (Exception e) {
+            throw new IllegalStateException("failed to init sha256 digest", e);
+        }
+
+        long size = 0;
+        try (InputStream in = file.getInputStream(); OutputStream out = Files.newOutputStream(dest)) {
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = in.read(buffer)) >= 0) {
+                if (read > 0) {
+                    out.write(buffer, 0, read);
+                    digest.update(buffer, 0, read);
+                    size += read;
+                }
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("failed to save file", e);
+        }
+
+        String sha256 = HexFormat.of().formatHex(digest.digest());
+        if (sha256.isBlank()) {
+            throw new IllegalStateException("failed to compute sha256");
+        }
+        return new SavedFile(size, sha256);
+    }
+
     private static String sha256Hex(Path path) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
@@ -278,6 +350,17 @@ public class IngestService {
             return null;
         }
     }
+
+    private static void tryDelete(Path path) {
+        if (path == null) return;
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException ignored) {
+            // best-effort cleanup
+        }
+    }
+
+    private record SavedFile(long size, String sha256) {}
 
     private record ResourceRow(long id, OffsetDateTime createdAt) {}
 }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List, Tuple, Optional, Callable
 import os
+import gc
 
 import pdfplumber
 from docx import Document
@@ -29,6 +30,15 @@ def extract_pdf_pages(
         total = len(pdf.pages)
         for idx, p in enumerate(pdf.pages, start=1):
             pages.append(p.extract_text() or "")
+            # pdfplumber는 페이지별 캐시(레이아웃/이미지 등)를 잡는 경우가 있어,
+            # 큰/스캔 PDF에서 메모리 사용량을 줄이기 위해 주기적으로 비웁니다.
+            try:
+                if hasattr(p, "flush_cache"):
+                    p.flush_cache()
+            except Exception:
+                pass
+            if idx % 10 == 0:
+                gc.collect()
             if on_progress:
                 on_progress(idx, total)
     if len(pages) >= 3 and sum(len(p.strip()) for p in pages) < 800:

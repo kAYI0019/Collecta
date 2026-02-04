@@ -5,6 +5,7 @@
 *.ear
 *.log
 .gradle/
+.gradle-user-home/
 build/
 bin/
 out/
