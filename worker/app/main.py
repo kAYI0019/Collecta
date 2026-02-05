@@ -39,6 +39,43 @@ EMBEDDING_BATCH_SIZE = int(os.environ.get("EMBEDDING_BATCH_SIZE", "16"))
 BACKEND_BASE_URL = os.environ.get("BACKEND_BASE_URL", "http://localhost:8080")
 
 
+class CancelledError(RuntimeError):
+    pass
+
+
+def _decode_json_bytes(raw: bytes) -> Optional[dict]:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def backend_post_json(path: str, payload: dict, timeout: int = 5) -> Tuple[Optional[int], Optional[dict]]:
+    url = f"{BACKEND_BASE_URL}{path}"
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.getcode(), _decode_json_bytes(resp.read())
+    except urllib.error.HTTPError as e:
+        body = b""
+        try:
+            body = e.read()
+        except Exception:
+            pass
+        return e.code, _decode_json_bytes(body)
+    except urllib.error.URLError as e:
+        print(f"[backend] request failed: {e} url={url}")
+        return None, None
+
+
 # -----------------------------
 # Request Models
 # -----------------------------
@@ -184,19 +221,20 @@ def update_ingest_status(resource_id: int, status: str, error_message: Optional[
         "status": status,
         "errorMessage": error_message,
     }
-    data = json.dumps(payload).encode("utf-8")
-    url = f"{BACKEND_BASE_URL}/api/ingest/status"
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            resp.read()
-    except urllib.error.URLError as e:
-        print(f"[status] failed to update ingest status: {e}")
+    code, data = backend_post_json("/api/ingest/status", payload)
+    if code is None:
+        return
+    if code == 404:
+        # 리소스 삭제 등으로 ingest_jobs가 없어진 경우
+        if status == "processing":
+            raise CancelledError("ingest job missing (deleted)")
+        return
+    if code >= 400:
+        print(f"[status] failed to update ingest status: code={code} body={data}")
+        return
+    # cancel 요청이 들어왔으면 즉시 중단 (processing으로 상태 전환 시에만 체크)
+    if status == "processing" and isinstance(data, dict) and data.get("status") == "cancelled":
+        raise CancelledError("cancelled_by_user")
 
 
 def update_ingest_progress(
@@ -211,19 +249,18 @@ def update_ingest_progress(
         "totalUnits": total_units,
         "processedUnits": processed_units,
     }
-    data = json.dumps(payload).encode("utf-8")
-    url = f"{BACKEND_BASE_URL}/api/ingest/progress"
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            resp.read()
-    except urllib.error.URLError as e:
-        print(f"[progress] failed to update ingest progress: {e}")
+    code, data = backend_post_json("/api/ingest/progress", payload)
+    if code is None:
+        return
+    if code == 404:
+        # 리소스가 삭제된 경우 (ingest_jobs 없음) => 즉시 중단
+        raise CancelledError("ingest job missing (deleted)")
+    if code >= 400:
+        print(f"[progress] failed to update ingest progress: code={code} body={data}")
+        return
+    # cancel 요청이 들어왔으면 즉시 중단 (backend는 progress 업데이트를 무시하고 status=cancelled를 유지)
+    if isinstance(data, dict) and data.get("status") == "cancelled":
+        raise CancelledError("cancelled_by_user")
 
 
 def make_progress_reporter(resource_id: int, stage: str):
@@ -275,9 +312,9 @@ def consume_outbox_events() -> None:
         created_at = payload.get("created_at")
         domain = payload.get("domain")
 
-        update_ingest_status(int(resource_id), "processing", None)
-
         try:
+            update_ingest_status(int(resource_id), "processing", None)
+
             if resource_type == "document":
                 doc = payload.get("document") or {}
                 req = IndexDocumentRequest(
@@ -330,6 +367,16 @@ def consume_outbox_events() -> None:
                 if isinstance(result.get("errors"), list) and result["errors"]:
                     err = result["errors"][0].get("message")
                 update_ingest_status(int(resource_id), "failed", err)
+        except CancelledError:
+            # 취소/삭제가 요청된 경우: 진행 중이던 인덱싱(부분 결과)을 제거하고 종료
+            try:
+                delete_by_resource_id(int(resource_id))
+            except Exception:
+                pass
+            try:
+                update_ingest_status(int(resource_id), "cancelled", "사용자 취소")
+            except Exception:
+                pass
         except Exception as e:
             update_ingest_status(int(resource_id), "failed", str(e))
 
@@ -495,6 +542,8 @@ def process_document(req: IndexDocumentRequest, progress_enabled: bool = False):
                 "errors": [{"code": "UNSUPPORTED_FORMAT", "message": f"mime_type not supported: {mime}"}],
             }
 
+    except CancelledError:
+        raise
     except Exception as e:
         return {
             "job_id": req.job_id,
@@ -534,6 +583,8 @@ def process_document(req: IndexDocumentRequest, progress_enabled: bool = False):
             )
             for d, v in zip(docs, vectors):
                 d["embedding"] = v
+        except CancelledError:
+            raise
         except Exception as e:
             return {
                 "job_id": req.job_id,
@@ -550,6 +601,8 @@ def process_document(req: IndexDocumentRequest, progress_enabled: bool = False):
             update_ingest_progress(int(req.resource_id), "indexing", len(docs), len(docs))
         delete_by_resource_id(req.resource_id)
         bulk_index(INDEX_NAME, docs)
+    except CancelledError:
+        raise
     except Exception as e:
         return {
             "job_id": req.job_id,
@@ -651,6 +704,8 @@ def process_link(req: IndexLinkRequest, progress_enabled: bool = False):
             )
             if vectors:
                 doc["embedding"] = vectors[0]
+        except CancelledError:
+            raise
         except Exception as e:
             return {
                 "job_id": req.job_id,
@@ -666,6 +721,8 @@ def process_link(req: IndexLinkRequest, progress_enabled: bool = False):
             update_ingest_progress(int(req.resource_id), "indexing", 1, 1)
         delete_by_resource_id(req.resource_id)
         bulk_index(INDEX_NAME, [doc])
+    except CancelledError:
+        raise
     except Exception as e:
         return {
             "job_id": req.job_id,

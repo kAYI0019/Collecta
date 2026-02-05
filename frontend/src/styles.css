@@ -179,6 +179,24 @@ button[type="submit"] {
   cursor: pointer;
 }
 
+.danger {
+  border: 1px solid #f2b6b6;
+  background: #fff;
+  color: #9b1c1c;
+  padding: 10px 12px;
+  border-radius: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.detail-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: flex-start;
+  padding: 6px 0 2px;
+}
+
 .accordion {
   padding: 12px;
   border-radius: 14px;
@@ -349,6 +367,11 @@ button[type="submit"]:not([disabled]):hover {
 .status.queued .badge {
   background: #e8e9f7;
   color: #3d3f91;
+}
+
+.status.cancelled .badge {
+  background: #eef1f5;
+  color: #3b4657;
 }
 
 .error-msg {

@@ -69,14 +69,27 @@ public class IngestStatusService {
     }
 
     public Optional<IngestStatus> updateStatus(long resourceId, String status, String errorMessage) {
-        jdbc.update(
-                """
-                UPDATE ingest_jobs
-                SET status = ?, error_message = ?, updated_at = NOW()
-                WHERE resource_id = ?
-                """,
-                status, errorMessage, resourceId
-        );
+        // 취소된 작업은 워커가 뒤늦게 status/progress를 올려도 덮어쓰지 않도록 보호합니다.
+        if ("cancelled".equalsIgnoreCase(status)) {
+            jdbc.update(
+                    """
+                    UPDATE ingest_jobs
+                    SET status = ?, error_message = ?, updated_at = NOW()
+                    WHERE resource_id = ?
+                    """,
+                    status, errorMessage, resourceId
+            );
+        } else {
+            jdbc.update(
+                    """
+                    UPDATE ingest_jobs
+                    SET status = ?, error_message = ?, updated_at = NOW()
+                    WHERE resource_id = ?
+                      AND status <> 'cancelled'
+                    """,
+                    status, errorMessage, resourceId
+            );
+        }
         return findByResourceId(resourceId);
     }
 
@@ -91,8 +104,25 @@ public class IngestStatusService {
                 UPDATE ingest_jobs
                 SET stage = ?, total_units = ?, processed_units = ?, updated_at = NOW()
                 WHERE resource_id = ?
+                  AND status <> 'cancelled'
                 """,
                 stage, totalUnits, processedUnits, resourceId
+        );
+        return findByResourceId(resourceId);
+    }
+
+    public Optional<IngestStatus> cancel(long resourceId) {
+        jdbc.update(
+                """
+                UPDATE ingest_jobs
+                SET status = 'cancelled',
+                    error_message = '사용자 취소',
+                    stage = 'cancelled',
+                    updated_at = NOW()
+                WHERE resource_id = ?
+                  AND status IN ('queued', 'processing')
+                """,
+                resourceId
         );
         return findByResourceId(resourceId);
     }

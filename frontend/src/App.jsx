@@ -41,6 +41,8 @@ export default function App() {
         return "완료";
       case "failed":
         return "실패";
+      case "cancelled":
+        return "취소됨";
       case "todo":
         return "할 일";
       case "in_progress":
@@ -60,6 +62,8 @@ export default function App() {
         return "인덱싱";
       case "done":
         return "완료";
+      case "cancelled":
+        return "취소";
       default:
         return value || "-";
     }
@@ -97,6 +101,44 @@ export default function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data?.message || "상세 조회 실패");
       setSelected(data);
+    } catch (err) {
+      setSelected({ error: err.message });
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  const cancelIngest = async (resourceId) => {
+    setDetailLoading(true);
+    try {
+      const res = await fetch(`/api/ingest/${resourceId}/cancel`, {
+        method: "POST"
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.message || "취소 실패");
+      setSelected(data);
+      fetchRecent();
+    } catch (err) {
+      setSelected({ error: err.message });
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  const deleteResource = async (resourceId) => {
+    const ok = window.confirm("정말 삭제할까요? (DB/파일/검색 인덱스에서 제거됩니다)");
+    if (!ok) return;
+    setDetailLoading(true);
+    try {
+      const res = await fetch(`/api/resources/${resourceId}`, {
+        method: "DELETE"
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data?.message || "삭제 실패");
+      }
+      setSelected(null);
+      fetchRecent();
     } catch (err) {
       setSelected({ error: err.message });
     } finally {
@@ -412,39 +454,59 @@ export default function App() {
                   <span className="label">title</span>
                   <span>{selected.title || "-"}</span>
                 </div>
-              <div>
-                <span className="label">status</span>
-                <span>{statusLabel(selected.status)}</span>
-              </div>
-              <div>
-                <span className="label">stage</span>
-                <span>{stageLabel(selected.stage)}</span>
-              </div>
-              <div>
-                <span className="label">updatedAt</span>
-                <span>{selected.updatedAt}</span>
-              </div>
-              <div className="full">
-                <span className="label">progress</span>
-                {selected.totalUnits ? (
-                  <div className="progress detail-progress">
-                    <div
-                      className="bar"
-                      style={{
-                        width: `${progressPercent(selected.processedUnits || 0, selected.totalUnits)}%`
-                      }}
-                    />
-                    <span className="progress-text">
-                      {selected.processedUnits || 0}/{selected.totalUnits}
-                    </span>
-                  </div>
-                ) : (
-                  <span>-</span>
-                )}
-              </div>
-              <div className="full">
-                <span className="label">error</span>
-                <span className="error-msg">{selected.errorMessage || "-"}</span>
+                <div className="full detail-actions">
+                  {(selected.status === "queued" || selected.status === "processing") && (
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => cancelIngest(selected.resourceId)}
+                      disabled={detailLoading}
+                    >
+                      업로드 중단
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="danger"
+                    onClick={() => deleteResource(selected.resourceId)}
+                    disabled={detailLoading}
+                  >
+                    삭제
+                  </button>
+                </div>
+                <div>
+                  <span className="label">status</span>
+                  <span>{statusLabel(selected.status)}</span>
+                </div>
+                <div>
+                  <span className="label">stage</span>
+                  <span>{stageLabel(selected.stage)}</span>
+                </div>
+                <div>
+                  <span className="label">updatedAt</span>
+                  <span>{selected.updatedAt}</span>
+                </div>
+                <div className="full">
+                  <span className="label">progress</span>
+                  {selected.totalUnits ? (
+                    <div className="progress detail-progress">
+                      <div
+                        className="bar"
+                        style={{
+                          width: `${progressPercent(selected.processedUnits || 0, selected.totalUnits)}%`
+                        }}
+                      />
+                      <span className="progress-text">
+                        {selected.processedUnits || 0}/{selected.totalUnits}
+                      </span>
+                    </div>
+                  ) : (
+                    <span>-</span>
+                  )}
+                </div>
+                <div className="full">
+                  <span className="label">error</span>
+                  <span className="error-msg">{selected.errorMessage || "-"}</span>
                 </div>
               </div>
             )}

@@ -48,6 +48,12 @@ public class IngestStatusController {
         ).orElseThrow(() -> new StatusNotFoundException(request.resourceId()));
     }
 
+    @PostMapping("/{resourceId}/cancel")
+    public IngestStatusService.IngestStatus cancel(@PathVariable long resourceId) {
+        return ingestStatusService.cancel(resourceId)
+                .orElseThrow(() -> new StatusNotFoundException(resourceId));
+    }
+
     @ResponseStatus(HttpStatus.NOT_FOUND)
     private static class StatusNotFoundException extends RuntimeException {
         StatusNotFoundException(long resourceId) {
