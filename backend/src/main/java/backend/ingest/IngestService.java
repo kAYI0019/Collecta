@@ -16,10 +16,11 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.time.OffsetDateTime;
-import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 @Service
 public class IngestService {
@@ -39,7 +40,7 @@ public class IngestService {
     }
 
     @Transactional
-    public long ingestDocument(
+    public DocumentIngestResult ingestDocument(
             MultipartFile file,
             String title,
             String memo,
@@ -82,7 +83,7 @@ public class IngestService {
         Long existingResourceId = findExistingDocumentResourceId(saved.sha256());
         if (existingResourceId != null) {
             tryDelete(tmp);
-            return existingResourceId;
+            return new DocumentIngestResult(existingResourceId, true);
         }
 
         String mimeType = file.getContentType();
@@ -92,7 +93,6 @@ public class IngestService {
 
         // 2) Persist new resource + move temp file into place
         ResourceRow resource = insertResource("document", safeTitle, safeMemo, safeStatus, isPinned);
-        insertIngestJob(resource.id(), "document", safeTitle);
 
         Path resourceDir = baseDir.resolve(Long.toString(resource.id()));
         try {
@@ -110,11 +110,14 @@ public class IngestService {
             throw new IllegalStateException("failed to move file into place", e);
         }
 
-        jdbc.update(
+        List<Long> insertedIds = jdbc.query(
                 """
                 INSERT INTO documents (resource_id, file_path, mime_type, file_size, sha256)
                 VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (sha256) DO NOTHING
+                RETURNING resource_id
                 """,
+                (rs, rowNum) -> rs.getLong("resource_id"),
                 resource.id(),
                 dest.toString(),
                 mimeType,
@@ -122,6 +125,17 @@ public class IngestService {
                 saved.sha256()
         );
 
+        if (insertedIds.isEmpty()) {
+            Long dedupedResourceId = findExistingDocumentResourceId(saved.sha256());
+            jdbc.update("DELETE FROM resources WHERE id = ?", resource.id());
+            tryDeleteDirectory(resourceDir);
+            if (dedupedResourceId != null) {
+                return new DocumentIngestResult(dedupedResourceId, true);
+            }
+            throw new IllegalStateException("duplicate document detected but existing resource not found");
+        }
+
+        insertIngestJob(resource.id(), "document", safeTitle);
         attachTags(resource.id(), tags);
         publishIndexEvent(resource, "document", null, tags, safeStatus, isPinned, Map.of(
                 "file_path", dest.toString(),
@@ -129,7 +143,7 @@ public class IngestService {
                 "file_name", originalFilename
         ), null);
 
-        return resource.id();
+        return new DocumentIngestResult(resource.id(), false);
     }
 
     @Transactional
@@ -333,24 +347,6 @@ public class IngestService {
         return new SavedFile(size, sha256);
     }
 
-    private static String sha256Hex(Path path) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            try (InputStream in = Files.newInputStream(path)) {
-                byte[] buffer = new byte[8192];
-                int read;
-                while ((read = in.read(buffer)) >= 0) {
-                    if (read > 0) {
-                        digest.update(buffer, 0, read);
-                    }
-                }
-            }
-            return HexFormat.of().formatHex(digest.digest());
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
     private static void tryDelete(Path path) {
         if (path == null) return;
         try {
@@ -360,7 +356,17 @@ public class IngestService {
         }
     }
 
+    private static void tryDeleteDirectory(Path path) {
+        if (path == null || !Files.exists(path)) return;
+        try (Stream<Path> walk = Files.walk(path)) {
+            walk.sorted(Comparator.reverseOrder()).forEach(IngestService::tryDelete);
+        } catch (IOException ignored) {
+            // best-effort cleanup
+        }
+    }
+
     private record SavedFile(long size, String sha256) {}
+    public record DocumentIngestResult(long resourceId, boolean deduplicated) {}
 
     private record ResourceRow(long id, OffsetDateTime createdAt) {}
 }

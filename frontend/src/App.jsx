@@ -43,6 +43,8 @@ export default function App() {
         return "실패";
       case "cancelled":
         return "취소됨";
+      case "reused":
+        return "기존 문서 재사용";
       case "todo":
         return "할 일";
       case "in_progress":
@@ -372,7 +374,9 @@ export default function App() {
               {result.error ? (
                 <span>에러: {result.error}</span>
               ) : (
-                <span>요청 완료: resourceId={result.resourceId}</span>
+                <span>
+                  {result.deduplicated ? "기존 문서 재사용" : "요청 완료"}: resourceId={result.resourceId}
+                </span>
               )}
             </div>
           )}

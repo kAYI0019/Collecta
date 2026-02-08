@@ -27,8 +27,10 @@ public class UploadController {
             @RequestParam(required = false) String tags
     ) {
         List<String> tagList = parseTags(tags);
-        long resourceId = ingestService.ingestDocument(file, title, memo, status, isPinned, tagList);
-        return new UploadResponse(resourceId, "queued");
+        IngestService.DocumentIngestResult result =
+                ingestService.ingestDocument(file, title, memo, status, isPinned, tagList);
+        String uploadStatus = result.deduplicated() ? "reused" : "queued";
+        return new UploadResponse(result.resourceId(), uploadStatus, result.deduplicated());
     }
 
     @PostMapping(value = "/link", consumes = MediaType.APPLICATION_JSON_VALUE)
@@ -42,7 +44,7 @@ public class UploadController {
                 request.isPinned(),
                 tagList
         );
-        return new UploadResponse(resourceId, "queued");
+        return new UploadResponse(resourceId, "queued", false);
     }
 
     private static List<String> parseTags(String tags) {
@@ -50,7 +52,7 @@ public class UploadController {
         return List.of(tags.split("\\s*,\\s*"));
     }
 
-    public record UploadResponse(long resourceId, String status) {}
+    public record UploadResponse(long resourceId, String status, boolean deduplicated) {}
 
     public record LinkUploadRequest(
             String url,
