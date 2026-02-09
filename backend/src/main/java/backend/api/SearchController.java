@@ -1,8 +1,7 @@
 package backend.api;
 
 import backend.search.SearchService;
-import backend.search.dto.PagedResponse;
-import backend.search.dto.SearchResourceItemDto;
+import backend.search.dto.SearchResponseDto;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -18,7 +17,7 @@ public class SearchController {
     }
 
     @GetMapping
-    public PagedResponse<SearchResourceItemDto> search(
+    public SearchResponseDto search(
             @RequestParam(required = false) String q,
             @RequestParam(required = false) String resourceType,
             @RequestParam(required = false) String domain,
@@ -26,6 +25,8 @@ public class SearchController {
             @RequestParam(required = false) Boolean isPinned,
             @RequestParam(required = false) String tags,
             @RequestParam(required = false, defaultValue = "keyword") String mode,
+            @RequestParam(required = false, defaultValue = "false") boolean debug,
+            @RequestParam(required = false, defaultValue = "true") boolean log,
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "20") int pageSize,
             @RequestParam(defaultValue = "relevance") String sort
@@ -34,20 +35,8 @@ public class SearchController {
                 ? List.of()
                 : List.of(tags.split("\\s*,\\s*"));
 
-        String m = (mode == null ? "keyword" : mode).toLowerCase();
-        if (m.equals("semantic")) {
-            return searchService.searchResourceCardsSemantic(
-                    q, resourceType, domain, status, isPinned, tagList, page, pageSize, sort
-            );
-        }
-        if (m.equals("hybrid")) {
-            return searchService.searchResourceCardsHybrid(
-                    q, resourceType, domain, status, isPinned, tagList, page, pageSize, sort
-            );
-        }
-
         return searchService.searchResourceCards(
-                q, resourceType, domain, status, isPinned, tagList, page, pageSize, sort
+                q, resourceType, domain, status, isPinned, tagList, page, pageSize, sort, mode, debug, log
         );
     }
 }

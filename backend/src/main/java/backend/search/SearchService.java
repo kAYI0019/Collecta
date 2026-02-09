@@ -1,7 +1,10 @@
 package backend.search;
 
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch._types.FieldValue;
 import co.elastic.clients.elasticsearch._types.query_dsl.BoolQuery;
+import co.elastic.clients.elasticsearch._types.query_dsl.FunctionBoostMode;
+import co.elastic.clients.elasticsearch._types.query_dsl.FunctionScoreMode;
 import co.elastic.clients.elasticsearch._types.query_dsl.Query;
 import co.elastic.clients.elasticsearch.core.SearchRequest;
 import co.elastic.clients.elasticsearch.core.SearchResponse;
@@ -9,11 +12,19 @@ import co.elastic.clients.elasticsearch.core.search.Hit;
 import co.elastic.clients.json.JsonData;
 import backend.search.dto.GroupedSearchResultDto;
 import backend.search.dto.PagedResponse;
+import backend.search.dto.SearchDebugMetaDto;
 import backend.search.dto.SearchResourceItemDto;
+import backend.search.dto.SearchResponseDto;
 import backend.search.internal.ResourceMeta;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 @Service
@@ -24,18 +35,200 @@ public class SearchService {
     private final ElasticsearchClient es;
     private final ResourceMetaRepository resourceMetaRepository;
     private final EmbeddingClient embeddingClient;
+    private final SearchQueryLogService searchQueryLogService;
+    private final double hybridVectorWeight;
 
     public SearchService(
             ElasticsearchClient es,
             ResourceMetaRepository resourceMetaRepository,
-            EmbeddingClient embeddingClient
+            EmbeddingClient embeddingClient,
+            SearchQueryLogService searchQueryLogService,
+            @Value("${search.hybrid.vector-weight:0.4}") double hybridVectorWeight
     ) {
         this.es = es;
         this.resourceMetaRepository = resourceMetaRepository;
         this.embeddingClient = embeddingClient;
+        this.searchQueryLogService = searchQueryLogService;
+        this.hybridVectorWeight = hybridVectorWeight;
     }
 
-    public PagedResponse<GroupedSearchResultDto> searchGroupedPaged(
+    public SearchResponseDto searchResourceCards(
+            String q,
+            String resourceType,
+            String domain,
+            String status,
+            Boolean isPinned,
+            List<String> tags,
+            int page,
+            int pageSize,
+            String sort,
+            String mode,
+            boolean debug,
+            boolean logQuery
+    ) throws Exception {
+        long startedAt = System.currentTimeMillis();
+        String effectiveMode = normalizeMode(mode);
+        int safePage = clampNonNeg(page);
+        int safePageSize = clampPageSize(pageSize);
+
+        if (q == null || q.isBlank()) {
+            SearchResponseDto empty = new SearchResponseDto(
+                    List.of(),
+                    safePage,
+                    safePageSize,
+                    0,
+                    0,
+                    new SearchDebugMetaDto(effectiveMode, debug, System.currentTimeMillis() - startedAt, null, 0L)
+            );
+            if (logQuery) {
+                searchQueryLogService.log(
+                        q,
+                        effectiveMode,
+                        resourceType,
+                        domain,
+                        status,
+                        isPinned,
+                        tags,
+                        sort,
+                        safePage,
+                        safePageSize,
+                        0,
+                        empty.debug().totalMs()
+                );
+            }
+            return empty;
+        }
+
+        Long embedMs = null;
+        List<Double> queryVector = null;
+        if (effectiveMode.equals("semantic") || effectiveMode.equals("hybrid")) {
+            long embedStart = System.currentTimeMillis();
+            queryVector = embeddingClient.embedOne(q);
+            embedMs = System.currentTimeMillis() - embedStart;
+        }
+
+        SearchRunResult runResult;
+        switch (effectiveMode) {
+            case "semantic" -> runResult = runSemantic(
+                    q, queryVector, resourceType, domain, status, isPinned, tags, safePage, safePageSize, sort
+            );
+            case "hybrid" -> runResult = runHybrid(
+                    q, queryVector, resourceType, domain, status, isPinned, tags, safePage, safePageSize, sort
+            );
+            default -> runResult = runKeyword(
+                    q, resourceType, domain, status, isPinned, tags, safePage, safePageSize, sort
+            );
+        }
+
+        PagedResponse<GroupedSearchResultDto> grouped = runResult.grouped();
+
+        List<Long> ids = grouped.items().stream()
+                .map(it -> Long.parseLong(it.resourceId()))
+                .toList();
+
+        Map<Long, ResourceMeta> metaMap = resourceMetaRepository.findByIds(ids);
+        Map<String, ScoreParts> scoreMap = debug
+                ? buildDebugScores(effectiveMode, q, queryVector, grouped.items())
+                : Map.of();
+
+        List<SearchResourceItemDto> items = grouped.items().stream().map(g -> {
+            long id = Long.parseLong(g.resourceId());
+            ResourceMeta m = metaMap.get(id);
+
+            ScoreParts scoreParts = scoreMap.get(g.resourceId());
+            Double keywordScore = scoreParts == null ? null : scoreParts.keywordScore();
+            Double vectorScore = scoreParts == null ? null : scoreParts.vectorScore();
+            Double finalScore = scoreParts == null ? null : scoreParts.finalScore();
+
+            if (m == null) {
+                return new SearchResourceItemDto(
+                        id,
+                        g.resourceType(),
+                        null,
+                        null,
+                        null,
+                        false,
+                        null,
+                        null,
+                        g.domain(),
+                        null,
+                        null,
+                        null,
+                        null,
+                        g.tags(),
+                        g.matchCount(),
+                        g.bestScore(),
+                        g.bestSnippet(),
+                        g.bestPageIndex(),
+                        keywordScore,
+                        vectorScore,
+                        finalScore
+                );
+            }
+
+            return new SearchResourceItemDto(
+                    m.resourceId(),
+                    m.type(),
+                    m.title(),
+                    m.memo(),
+                    m.status(),
+                    m.isPinned(),
+                    m.createdAt(),
+                    m.url(),
+                    m.domain(),
+                    m.filePath(),
+                    m.mimeType(),
+                    m.fileSize(),
+                    m.sha256(),
+                    m.tags(),
+                    g.matchCount(),
+                    g.bestScore(),
+                    g.bestSnippet(),
+                    g.bestPageIndex(),
+                    keywordScore,
+                    vectorScore,
+                    finalScore
+            );
+        }).toList();
+
+        long totalMs = System.currentTimeMillis() - startedAt;
+
+        SearchResponseDto response = new SearchResponseDto(
+                items,
+                grouped.page(),
+                grouped.pageSize(),
+                grouped.total(),
+                grouped.totalPages(),
+                new SearchDebugMetaDto(
+                        effectiveMode,
+                        debug,
+                        totalMs,
+                        embedMs,
+                        runResult.esMs()
+                )
+        );
+
+        if (logQuery) {
+            searchQueryLogService.log(
+                    q,
+                    effectiveMode,
+                    resourceType,
+                    domain,
+                    status,
+                    isPinned,
+                    tags,
+                    sort,
+                    safePage,
+                    safePageSize,
+                    response.total(),
+                    totalMs
+            );
+        }
+
+        return response;
+    }
+
+    private SearchRunResult runKeyword(
             String q,
             String resourceType,
             String domain,
@@ -46,15 +239,7 @@ public class SearchService {
             int pageSize,
             String sort
     ) throws Exception {
-
-        if (q == null || q.isBlank()) {
-            return new PagedResponse<>(List.of(), clampNonNeg(page), clampPageSize(pageSize), 0, 0);
-        }
-
-        page = clampNonNeg(page);
-        pageSize = clampPageSize(pageSize);
-
-        int fetchSize = Math.max(300, pageSize * 30); // 필터/그룹핑 고려해 넉넉히
+        int fetchSize = Math.max(300, pageSize * 30);
 
         Query query = Query.of(qb -> qb.bool(b -> {
             b.must(m -> m.match(mm -> mm.field("chunk_text").query(q)));
@@ -69,14 +254,17 @@ public class SearchService {
                 .highlight(h -> h.fields("chunk_text", f -> f))
         );
 
+        long esStart = System.currentTimeMillis();
         SearchResponse<Map> response = es.search(request, Map.class);
-        List<Hit<Map>> hits = response.hits().hits();
+        long esMs = System.currentTimeMillis() - esStart;
 
-        return groupAndPage(hits, page, pageSize, sort);
+        PagedResponse<GroupedSearchResultDto> grouped = groupAndPage(response.hits().hits(), page, pageSize, sort);
+        return new SearchRunResult(grouped, esMs);
     }
 
-    public PagedResponse<GroupedSearchResultDto> searchGroupedPagedVector(
+    private SearchRunResult runSemantic(
             String q,
+            List<Double> queryVector,
             String resourceType,
             String domain,
             String status,
@@ -86,15 +274,6 @@ public class SearchService {
             int pageSize,
             String sort
     ) throws Exception {
-        if (q == null || q.isBlank()) {
-            return new PagedResponse<>(List.of(), clampNonNeg(page), clampPageSize(pageSize), 0, 0);
-        }
-
-        List<Double> queryVector = embeddingClient.embedOne(q);
-
-        page = clampNonNeg(page);
-        pageSize = clampPageSize(pageSize);
-
         int fetchSize = Math.max(300, pageSize * 30);
 
         Query query = Query.of(qb -> qb.bool(b -> {
@@ -116,14 +295,17 @@ public class SearchService {
                 .highlight(h -> h.fields("chunk_text", f -> f))
         );
 
+        long esStart = System.currentTimeMillis();
         SearchResponse<Map> response = es.search(request, Map.class);
-        List<Hit<Map>> hits = response.hits().hits();
+        long esMs = System.currentTimeMillis() - esStart;
 
-        return groupAndPage(hits, page, pageSize, sort);
+        PagedResponse<GroupedSearchResultDto> grouped = groupAndPage(response.hits().hits(), page, pageSize, sort);
+        return new SearchRunResult(grouped, esMs);
     }
 
-    public PagedResponse<GroupedSearchResultDto> searchGroupedPagedHybrid(
+    private SearchRunResult runHybrid(
             String q,
+            List<Double> queryVector,
             String resourceType,
             String domain,
             String status,
@@ -133,15 +315,6 @@ public class SearchService {
             int pageSize,
             String sort
     ) throws Exception {
-        if (q == null || q.isBlank()) {
-            return new PagedResponse<>(List.of(), clampNonNeg(page), clampPageSize(pageSize), 0, 0);
-        }
-
-        List<Double> queryVector = embeddingClient.embedOne(q);
-
-        page = clampNonNeg(page);
-        pageSize = clampPageSize(pageSize);
-
         int fetchSize = Math.max(300, pageSize * 30);
 
         Query keywordQuery = Query.of(qb -> qb.bool(b -> {
@@ -158,10 +331,10 @@ public class SearchService {
                                         .params("query_vector", JsonData.of(queryVector))
                                 )
                         )
-                        .weight(0.4)
+                        .weight(hybridVectorWeight)
                 )
-                .scoreMode(co.elastic.clients.elasticsearch._types.query_dsl.FunctionScoreMode.Sum)
-                .boostMode(co.elastic.clients.elasticsearch._types.query_dsl.FunctionBoostMode.Sum)
+                .scoreMode(FunctionScoreMode.Sum)
+                .boostMode(FunctionBoostMode.Sum)
         ));
 
         SearchRequest request = SearchRequest.of(s -> s
@@ -171,15 +344,152 @@ public class SearchService {
                 .highlight(h -> h.fields("chunk_text", f -> f))
         );
 
+        long esStart = System.currentTimeMillis();
         SearchResponse<Map> response = es.search(request, Map.class);
-        List<Hit<Map>> hits = response.hits().hits();
+        long esMs = System.currentTimeMillis() - esStart;
 
-        return groupAndPage(hits, page, pageSize, sort);
+        PagedResponse<GroupedSearchResultDto> grouped = groupAndPage(response.hits().hits(), page, pageSize, sort);
+        return new SearchRunResult(grouped, esMs);
     }
 
-    // -------- Helpers --------
-    private static int clampNonNeg(int v) { return Math.max(0, v); }
-    private static int clampPageSize(int v) { if (v <= 0) return 20; return Math.min(v, 100); }
+    private Map<String, ScoreParts> buildDebugScores(
+            String mode,
+            String q,
+            List<Double> queryVector,
+            List<GroupedSearchResultDto> groupedItems
+    ) throws Exception {
+        Map<String, ScoreParts> out = new HashMap<>();
+        for (GroupedSearchResultDto g : groupedItems) {
+            out.put(g.resourceId(), new ScoreParts(null, null, g.bestScore()));
+        }
+
+        if (groupedItems.isEmpty()) {
+            return out;
+        }
+
+        List<String> ids = groupedItems.stream().map(GroupedSearchResultDto::resourceId).toList();
+
+        if (mode.equals("keyword")) {
+            for (GroupedSearchResultDto g : groupedItems) {
+                out.put(g.resourceId(), new ScoreParts(g.bestScore(), null, g.bestScore()));
+            }
+            return out;
+        }
+
+        if (mode.equals("semantic")) {
+            for (GroupedSearchResultDto g : groupedItems) {
+                out.put(g.resourceId(), new ScoreParts(null, g.bestScore(), g.bestScore()));
+            }
+            return out;
+        }
+
+        Map<String, Double> keywordMap = fetchKeywordScoresByResource(q, ids);
+        Map<String, Double> vectorMap = fetchVectorScoresByResource(queryVector, ids);
+
+        for (GroupedSearchResultDto g : groupedItems) {
+            out.put(
+                    g.resourceId(),
+                    new ScoreParts(
+                            keywordMap.get(g.resourceId()),
+                            vectorMap.get(g.resourceId()),
+                            g.bestScore()
+                    )
+            );
+        }
+
+        return out;
+    }
+
+    private Map<String, Double> fetchKeywordScoresByResource(String q, List<String> resourceIds) throws Exception {
+        int fetchSize = Math.min(5000, Math.max(500, resourceIds.size() * 80));
+
+        Query query = Query.of(qb -> qb.bool(b -> b
+                .must(m -> m.match(mm -> mm.field("chunk_text").query(q)))
+                .filter(f -> f.terms(t -> t
+                        .field("resource_id")
+                        .terms(tt -> tt.value(resourceIds.stream().map(FieldValue::of).toList()))
+                ))
+        ));
+
+        SearchRequest request = SearchRequest.of(s -> s
+                .index(INDEX)
+                .size(fetchSize)
+                .query(query)
+        );
+
+        SearchResponse<Map> response = es.search(request, Map.class);
+        Map<String, Double> out = new HashMap<>();
+
+        for (Hit<Map> hit : response.hits().hits()) {
+            Map<String, Object> src = hit.source();
+            if (src == null) continue;
+            Object rid = src.get("resource_id");
+            if (rid == null) continue;
+
+            String id = String.valueOf(rid);
+            double score = Optional.ofNullable(hit.score()).orElse(0.0);
+            out.merge(id, score, Math::max);
+        }
+
+        return out;
+    }
+
+    private Map<String, Double> fetchVectorScoresByResource(List<Double> queryVector, List<String> resourceIds) throws Exception {
+        int fetchSize = Math.min(5000, Math.max(500, resourceIds.size() * 80));
+
+        Query query = Query.of(qb -> qb.bool(b -> b
+                .must(m -> m.scriptScore(ss -> ss
+                        .query(qm -> qm.matchAll(ma -> ma))
+                        .script(sc -> sc
+                                .source("cosineSimilarity(params.query_vector, 'embedding') + 1.0")
+                                .params("query_vector", JsonData.of(queryVector))
+                        )
+                ))
+                .filter(f -> f.terms(t -> t
+                        .field("resource_id")
+                        .terms(tt -> tt.value(resourceIds.stream().map(FieldValue::of).toList()))
+                ))
+        ));
+
+        SearchRequest request = SearchRequest.of(s -> s
+                .index(INDEX)
+                .size(fetchSize)
+                .query(query)
+        );
+
+        SearchResponse<Map> response = es.search(request, Map.class);
+        Map<String, Double> out = new HashMap<>();
+
+        for (Hit<Map> hit : response.hits().hits()) {
+            Map<String, Object> src = hit.source();
+            if (src == null) continue;
+            Object rid = src.get("resource_id");
+            if (rid == null) continue;
+
+            String id = String.valueOf(rid);
+            double score = Optional.ofNullable(hit.score()).orElse(0.0);
+            out.merge(id, score, Math::max);
+        }
+
+        return out;
+    }
+
+    private static int clampNonNeg(int v) {
+        return Math.max(0, v);
+    }
+
+    private static int clampPageSize(int v) {
+        if (v <= 0) return 20;
+        return Math.min(v, 100);
+    }
+
+    private static String normalizeMode(String mode) {
+        String m = (mode == null ? "keyword" : mode).toLowerCase();
+        if (!m.equals("keyword") && !m.equals("semantic") && !m.equals("hybrid")) {
+            return "keyword";
+        }
+        return m;
+    }
 
     private static String extractSnippet(Hit<Map> hit, Map<String, Object> src) {
         if (hit.highlight() != null && hit.highlight().get("chunk_text") != null) {
@@ -190,7 +500,7 @@ public class SearchService {
         if (ct instanceof String s) {
             String t = s.strip();
             if (t.length() <= 220) return t;
-            return t.substring(0, 220) + "…";
+            return t.substring(0, 220) + "...";
         }
         return null;
     }
@@ -203,15 +513,18 @@ public class SearchService {
         }
         return List.of();
     }
+
     private static Integer safeInteger(Object v) {
         if (v instanceof Integer i) return i;
         if (v instanceof Number n) return n.intValue();
         return null;
     }
+
     private static Boolean safeBoolean(Object v) {
         if (v instanceof Boolean b) return b;
         return null;
     }
+
     private static String safeString(Object v) {
         if (v instanceof String s) return s;
         return null;
@@ -239,7 +552,7 @@ public class SearchService {
         }
         if (tags != null && !tags.isEmpty()) {
             b.filter(f -> f.terms(t -> t.field("tags").terms(tt -> tt.value(
-                    tags.stream().map(co.elastic.clients.elasticsearch._types.FieldValue::of).toList()
+                    tags.stream().map(FieldValue::of).toList()
             ))));
         }
     }
@@ -326,11 +639,12 @@ public class SearchService {
         String bestSnippet;
         Integer bestPageIndex;
 
-        // sorting 보조 필드
         Boolean isPinned;
         String createdAt;
 
-        Acc(String resourceId) { this.resourceId = resourceId; }
+        Acc(String resourceId) {
+            this.resourceId = resourceId;
+        }
 
         GroupedSearchResultDto toDto() {
             return new GroupedSearchResultDto(
@@ -346,169 +660,7 @@ public class SearchService {
         }
     }
 
-    public PagedResponse<SearchResourceItemDto> searchResourceCards(
-            String q,
-            String resourceType,
-            String domain,
-            String status,
-            Boolean isPinned,
-            List<String> tags,
-            int page,
-            int pageSize,
-            String sort
-    ) throws Exception {
-        // 1) ES에서 그룹핑 + 페이징 메타까지 얻기 (지금 네 메서드 그대로 활용)
-        PagedResponse<GroupedSearchResultDto> grouped =
-                searchGroupedPaged(q, resourceType, domain, status, isPinned, tags, page, pageSize, sort);
+    private record ScoreParts(Double keywordScore, Double vectorScore, Double finalScore) {}
 
-        // 2) 이번 페이지에 나온 resourceId들만 DB에서 메타 조회
-        List<Long> ids = grouped.items().stream()
-                .map(it -> Long.parseLong(it.resourceId()))
-                .toList();
-
-        Map<Long, ResourceMeta> metaMap = resourceMetaRepository.findByIds(ids);
-
-        // 3) ES 순서대로 합치기 (순서 유지 매우 중요)
-        List<SearchResourceItemDto> items = grouped.items().stream().map(g -> {
-            long id = Long.parseLong(g.resourceId());
-            ResourceMeta m = metaMap.get(id);
-
-            // 혹시 DB에 없으면(삭제됐는데 ES 남아있는 경우) 최소한의 fallback
-            if (m == null) {
-                return new SearchResourceItemDto(
-                        id, g.resourceType(),
-                        null, null, null, false, null,
-                        null, g.domain(),
-                        null, null, null, null,
-                        g.tags(),
-                        g.matchCount(), g.bestScore(), g.bestSnippet(), g.bestPageIndex()
-                );
-            }
-
-            return new SearchResourceItemDto(
-                    m.resourceId(), m.type(),
-                    m.title(), m.memo(), m.status(), m.isPinned(), m.createdAt(),
-                    m.url(), m.domain(),
-                    m.filePath(), m.mimeType(), m.fileSize(), m.sha256(),
-                    m.tags(), // tags는 DB 기준(정합성)
-                    g.matchCount(), g.bestScore(), g.bestSnippet(), g.bestPageIndex()
-            );
-        }).toList();
-
-        return new PagedResponse<>(
-                items,
-                grouped.page(),
-                grouped.pageSize(),
-                grouped.total(),
-                grouped.totalPages()
-        );
-    }
-
-    public PagedResponse<SearchResourceItemDto> searchResourceCardsSemantic(
-            String q,
-            String resourceType,
-            String domain,
-            String status,
-            Boolean isPinned,
-            List<String> tags,
-            int page,
-            int pageSize,
-            String sort
-    ) throws Exception {
-        PagedResponse<GroupedSearchResultDto> grouped =
-                searchGroupedPagedVector(q, resourceType, domain, status, isPinned, tags, page, pageSize, sort);
-
-        List<Long> ids = grouped.items().stream()
-                .map(it -> Long.parseLong(it.resourceId()))
-                .toList();
-
-        Map<Long, ResourceMeta> metaMap = resourceMetaRepository.findByIds(ids);
-
-        List<SearchResourceItemDto> items = grouped.items().stream().map(g -> {
-            long id = Long.parseLong(g.resourceId());
-            ResourceMeta m = metaMap.get(id);
-
-            if (m == null) {
-                return new SearchResourceItemDto(
-                        id, g.resourceType(),
-                        null, null, null, false, null,
-                        null, g.domain(),
-                        null, null, null, null,
-                        g.tags(),
-                        g.matchCount(), g.bestScore(), g.bestSnippet(), g.bestPageIndex()
-                );
-            }
-
-            return new SearchResourceItemDto(
-                    m.resourceId(), m.type(),
-                    m.title(), m.memo(), m.status(), m.isPinned(), m.createdAt(),
-                    m.url(), m.domain(),
-                    m.filePath(), m.mimeType(), m.fileSize(), m.sha256(),
-                    m.tags(),
-                    g.matchCount(), g.bestScore(), g.bestSnippet(), g.bestPageIndex()
-            );
-        }).toList();
-
-        return new PagedResponse<>(
-                items,
-                grouped.page(),
-                grouped.pageSize(),
-                grouped.total(),
-                grouped.totalPages()
-        );
-    }
-
-    public PagedResponse<SearchResourceItemDto> searchResourceCardsHybrid(
-            String q,
-            String resourceType,
-            String domain,
-            String status,
-            Boolean isPinned,
-            List<String> tags,
-            int page,
-            int pageSize,
-            String sort
-    ) throws Exception {
-        PagedResponse<GroupedSearchResultDto> grouped =
-                searchGroupedPagedHybrid(q, resourceType, domain, status, isPinned, tags, page, pageSize, sort);
-
-        List<Long> ids = grouped.items().stream()
-                .map(it -> Long.parseLong(it.resourceId()))
-                .toList();
-
-        Map<Long, ResourceMeta> metaMap = resourceMetaRepository.findByIds(ids);
-
-        List<SearchResourceItemDto> items = grouped.items().stream().map(g -> {
-            long id = Long.parseLong(g.resourceId());
-            ResourceMeta m = metaMap.get(id);
-
-            if (m == null) {
-                return new SearchResourceItemDto(
-                        id, g.resourceType(),
-                        null, null, null, false, null,
-                        null, g.domain(),
-                        null, null, null, null,
-                        g.tags(),
-                        g.matchCount(), g.bestScore(), g.bestSnippet(), g.bestPageIndex()
-                );
-            }
-
-            return new SearchResourceItemDto(
-                    m.resourceId(), m.type(),
-                    m.title(), m.memo(), m.status(), m.isPinned(), m.createdAt(),
-                    m.url(), m.domain(),
-                    m.filePath(), m.mimeType(), m.fileSize(), m.sha256(),
-                    m.tags(),
-                    g.matchCount(), g.bestScore(), g.bestSnippet(), g.bestPageIndex()
-            );
-        }).toList();
-
-        return new PagedResponse<>(
-                items,
-                grouped.page(),
-                grouped.pageSize(),
-                grouped.total(),
-                grouped.totalPages()
-        );
-    }
+    private record SearchRunResult(PagedResponse<GroupedSearchResultDto> grouped, long esMs) {}
 }

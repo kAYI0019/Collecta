@@ -32,5 +32,10 @@ public record SearchResourceItemDto(
         int matchCount,
         double bestScore,
         String bestSnippet,
-        Integer bestPageIndex
+        Integer bestPageIndex,
+
+        // debug meta (optional)
+        Double keywordScore,
+        Double vectorScore,
+        Double finalScore
 ) {}
