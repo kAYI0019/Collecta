@@ -2,6 +2,7 @@ package backend.ingest;
 
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -125,6 +126,38 @@ public class IngestStatusService {
                 resourceId
         );
         return findByResourceId(resourceId);
+    }
+
+    @Transactional
+    public List<Long> markStaleProcessingAsFailed(long staleMs, int limit, String errorMessage) {
+        long safeStaleMs = Math.max(1L, staleMs);
+        int safeLimit = Math.max(1, Math.min(limit, 1000));
+        String safeErrorMessage = (errorMessage == null || errorMessage.isBlank()) ? "처리 시간 초과" : errorMessage;
+        return jdbc.query(
+                """
+                WITH stale AS (
+                    SELECT resource_id
+                    FROM ingest_jobs
+                    WHERE status = 'processing'
+                      AND updated_at < NOW() - (? * INTERVAL '1 millisecond')
+                    ORDER BY updated_at
+                    LIMIT ?
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE ingest_jobs j
+                SET status = 'failed',
+                    stage = 'timeout',
+                    error_message = ?,
+                    updated_at = NOW()
+                FROM stale s
+                WHERE j.resource_id = s.resource_id
+                RETURNING j.resource_id
+                """,
+                (rs, rowNum) -> rs.getLong("resource_id"),
+                safeStaleMs,
+                safeLimit,
+                safeErrorMessage
+        );
     }
 
     public record IngestStatus(

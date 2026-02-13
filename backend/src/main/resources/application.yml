@@ -56,6 +56,14 @@ outbox:
     poll-interval-ms: 1000
     batch-size: 100
 
+ingest:
+  timeout:
+    enabled: true
+    sweep-interval-ms: 60000
+    stale-ms: 1800000
+    batch-size: 100
+    error-message: 처리 시간 초과
+
 server:
   port: 8080
   servlet:

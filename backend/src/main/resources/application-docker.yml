@@ -24,3 +24,10 @@ worker:
 
 storage:
   base-path: /data/uploads
+
+ingest:
+  timeout:
+    enabled: true
+    sweep-interval-ms: 60000
+    stale-ms: 1800000
+    batch-size: 100
