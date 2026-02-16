@@ -326,6 +326,136 @@ button[type="submit"]:not([disabled]):hover {
   gap: 8px;
 }
 
+.content-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: flex;
+  justify-content: flex-end;
+  padding: 20px;
+  background: rgba(26, 38, 56, 0.42);
+  backdrop-filter: blur(2px);
+}
+
+.content-drawer {
+  width: min(680px, 100%);
+  height: 100%;
+  background: #ffffff;
+  border-radius: 18px;
+  border: 1px solid #d8e2f0;
+  box-shadow: 0 22px 44px rgba(16, 34, 58, 0.22);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.content-drawer-head {
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid #e2e9f4;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.content-drawer-head h3 {
+  margin: 0 0 4px;
+}
+
+.content-drawer-body {
+  padding: 14px 16px 18px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.content-view {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.content-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.content-head .search-actions {
+  margin-top: 0;
+}
+
+.content-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #fff;
+  padding: 2px 0;
+}
+
+.content-tabs button {
+  border: 1px solid #c7d2e2;
+  background: #fff;
+  color: #2a3a55;
+  padding: 8px 10px;
+  border-radius: 10px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.content-tabs button.active {
+  background: #283452;
+  color: #fff;
+  border-color: #283452;
+}
+
+.chunk-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chunk-item {
+  border: 1px solid #dce5f2;
+  border-radius: 10px;
+  padding: 10px;
+  background: #fdfefe;
+}
+
+.chunk-meta-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.chunk-meta-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chunk-open {
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.chunk-text {
+  margin: 8px 0 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #2e3a4d;
+  white-space: pre-wrap;
+}
+
 .search-head {
   display: flex;
   align-items: center;
@@ -522,6 +652,15 @@ button[type="submit"]:not([disabled]):hover {
   }
   .search-grid {
     grid-template-columns: 1fr;
+  }
+  .content-drawer-backdrop {
+    padding: 0;
+  }
+  .content-drawer {
+    width: 100%;
+    height: 100%;
+    border-radius: 0;
+    border: none;
   }
 }
 

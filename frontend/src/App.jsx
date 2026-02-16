@@ -39,6 +39,15 @@ const emptySearchResponse = {
   debug: null
 };
 
+const emptyResourceContent = {
+  resourceId: null,
+  resourceType: "",
+  title: "",
+  query: null,
+  chunkCount: 0,
+  chunks: []
+};
+
 export default function App() {
   const [workspace, setWorkspace] = useState("upload");
 
@@ -58,6 +67,12 @@ export default function App() {
   const [searchResult, setSearchResult] = useState(emptySearchResponse);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState(null);
+  const [contentTarget, setContentTarget] = useState(null);
+  const [contentResult, setContentResult] = useState(emptyResourceContent);
+  const [contentLoading, setContentLoading] = useState(false);
+  const [contentError, setContentError] = useState(null);
+  const [contentTab, setContentTab] = useState("matched");
+  const [resourcePageIndexBaseMap, setResourcePageIndexBaseMap] = useState({});
 
   const statusLabel = (value) => {
     switch (value) {
@@ -121,6 +136,28 @@ export default function App() {
     if (value === null || value === undefined) return "-";
     if (Number.isNaN(value)) return "-";
     return Number(value).toFixed(4);
+  };
+
+  const detectPageIndexBase = (chunks) => {
+    const indices = (chunks || [])
+      .map((chunk) => chunk?.pageIndex)
+      .filter((v) => Number.isInteger(v) && v >= 0);
+
+    if (indices.length === 0) return 0;
+    const minPageIndex = Math.min(...indices);
+    return minPageIndex >= 1 ? 1 : 0;
+  };
+
+  const toPdfPageNumber = (pageIndex, pageIndexBase = 0) => {
+    if (!Number.isInteger(pageIndex) || pageIndex < 0) return null;
+    if (pageIndexBase === 1) return pageIndex;
+    return pageIndex + 1;
+  };
+
+  const toDisplayPageNumber = (pageIndex, pageIndexBase = 0) => {
+    const pageNumber = toPdfPageNumber(pageIndex, pageIndexBase);
+    if (!Number.isInteger(pageNumber) || pageNumber < 1) return null;
+    return pageNumber;
   };
 
   const fetchRecent = async () => {
@@ -326,6 +363,11 @@ export default function App() {
 
     setSearchLoading(true);
     setSearchError(null);
+    setContentTarget(null);
+    setContentResult(emptyResourceContent);
+    setContentError(null);
+    setContentTab("matched");
+    setResourcePageIndexBaseMap({});
     try {
       const res = await fetch(`/api/search?${params.toString()}`);
       const data = await res.json();
@@ -351,13 +393,20 @@ export default function App() {
     await runSearch(nextPage);
   };
 
-  const openDocumentViewer = (item) => {
+  const openDocumentViewer = (item, options = {}) => {
+    const effectivePageIndex =
+      typeof options.pageIndex === "number" ? options.pageIndex : item.bestPageIndex;
+    const effectiveQuery =
+      typeof options.query === "string" ? options.query.trim() : (search.q?.trim() || "");
+    const effectivePageIndexBase = options.pageIndexBase === 1 ? 1 : 0;
+
     const hash = new URLSearchParams();
-    if (typeof item.bestPageIndex === "number" && item.bestPageIndex >= 0) {
-      hash.set("page", String(item.bestPageIndex + 1));
+    const pageNumber = toPdfPageNumber(effectivePageIndex, effectivePageIndexBase);
+    if (Number.isInteger(pageNumber) && pageNumber >= 1) {
+      hash.set("page", String(pageNumber));
     }
-    if (search.q?.trim()) {
-      hash.set("search", search.q.trim());
+    if (effectiveQuery) {
+      hash.set("search", effectiveQuery);
     }
 
     const baseUrl = `/api/resources/${item.resourceId}/file`;
@@ -369,6 +418,114 @@ export default function App() {
     if (!item?.url) return;
     window.open(item.url, "_blank", "noopener,noreferrer");
   };
+
+  const loadResourceContent = async (item) => {
+    setContentTarget(item);
+    setContentLoading(true);
+    setContentError(null);
+    setContentResult(emptyResourceContent);
+    setContentTab("matched");
+
+    const params = new URLSearchParams();
+    if (search.q?.trim()) {
+      params.set("q", search.q.trim());
+    }
+
+    const queryString = params.toString();
+    const url = queryString
+      ? `/api/resources/${item.resourceId}/content?${queryString}`
+      : `/api/resources/${item.resourceId}/content`;
+
+    try {
+      const res = await fetch(url);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.message || "본문 조회 실패");
+      setContentResult(data);
+      const pageIndexBase = detectPageIndexBase(data?.chunks || []);
+      setResourcePageIndexBaseMap((prev) => ({
+        ...prev,
+        [item.resourceId]: pageIndexBase
+      }));
+    } catch (err) {
+      setContentError(err.message);
+      setContentResult(emptyResourceContent);
+    } finally {
+      setContentLoading(false);
+    }
+  };
+
+  const resolvePageIndexBase = async (resourceId) => {
+    const cached = resourcePageIndexBaseMap[resourceId];
+    if (cached === 0 || cached === 1) {
+      return cached;
+    }
+
+    try {
+      const res = await fetch(`/api/resources/${resourceId}/content`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.message || "본문 조회 실패");
+
+      const pageIndexBase = detectPageIndexBase(data?.chunks || []);
+      setResourcePageIndexBaseMap((prev) => ({
+        ...prev,
+        [resourceId]: pageIndexBase
+      }));
+      return pageIndexBase;
+    } catch (error) {
+      return 0;
+    }
+  };
+
+  const openDocumentViewerFromSearch = async (item) => {
+    const pageIndexBase = await resolvePageIndexBase(item.resourceId);
+    openDocumentViewer(item, { pageIndexBase });
+  };
+
+  const closeContentViewer = () => {
+    setContentTarget(null);
+    setContentResult(emptyResourceContent);
+    setContentError(null);
+    setContentLoading(false);
+    setContentTab("matched");
+  };
+
+  useEffect(() => {
+    if (workspace === "search") return;
+    setContentTarget(null);
+    setContentResult(emptyResourceContent);
+    setContentError(null);
+    setContentLoading(false);
+    setContentTab("matched");
+    setResourcePageIndexBaseMap({});
+  }, [workspace]);
+
+  useEffect(() => {
+    if (!contentTarget) return;
+
+    const originalOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    const onKeyDown = (event) => {
+      if (event.key !== "Escape") return;
+      setContentTarget(null);
+      setContentResult(emptyResourceContent);
+      setContentError(null);
+      setContentLoading(false);
+      setContentTab("matched");
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = originalOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [contentTarget]);
+
+  const contentPageIndexBase = contentTarget
+    ? (resourcePageIndexBaseMap[contentTarget.resourceId] ?? detectPageIndexBase(contentResult.chunks || []))
+    : 0;
+  const matchedChunks = (contentResult.chunks || []).filter((chunk) => chunk.matched);
+  const visibleChunks = contentTab === "matched" ? matchedChunks : (contentResult.chunks || []);
 
   return (
     <div className="page playful">
@@ -791,56 +948,68 @@ export default function App() {
               <p className="muted">결과가 없습니다.</p>
             ) : (
               <ul className="search-list">
-                {searchResult.items.map((item) => (
-                  <li key={item.resourceId} className="search-item">
-                    <div className="search-head">
-                      <strong>{item.title || "(제목 없음)"}</strong>
-                      <span className="badge small">{item.type}</span>
-                    </div>
-                    <p className="meta">
-                      #{item.resourceId} · score {formatScore(item.bestScore)} · match {item.matchCount}
-                    </p>
-                    {typeof item.bestPageIndex === "number" && item.bestPageIndex >= 0 && (
-                      <p className="meta">best page: {item.bestPageIndex + 1}</p>
-                    )}
-                    {item.tags?.length > 0 && (
-                      <p className="meta">tags: {item.tags.join(", ")}</p>
-                    )}
-                    {item.bestSnippet && (
-                      <p
-                        className="snippet"
-                        dangerouslySetInnerHTML={{ __html: item.bestSnippet }}
-                      />
-                    )}
-                    {searchResult?.debug?.enabled && (
-                      <div className="score-row">
-                        <span>keyword {formatScore(item.keywordScore)}</span>
-                        <span>vector {formatScore(item.vectorScore)}</span>
-                        <span>final {formatScore(item.finalScore)}</span>
+                {searchResult.items.map((item) => {
+                  const knownPageIndexBase = resourcePageIndexBaseMap[item.resourceId] ?? 0;
+                  const bestPageNumber = toDisplayPageNumber(item.bestPageIndex, knownPageIndexBase);
+
+                  return (
+                    <li key={item.resourceId} className="search-item">
+                      <div className="search-head">
+                        <strong>{item.title || "(제목 없음)"}</strong>
+                        <span className="badge small">{item.type}</span>
                       </div>
-                    )}
-                    <div className="search-actions">
-                      {item.type === "document" && (
+                      <p className="meta">
+                        #{item.resourceId} · score {formatScore(item.bestScore)} · match {item.matchCount}
+                      </p>
+                      {bestPageNumber !== null && (
+                        <p className="meta">best page: {bestPageNumber}</p>
+                      )}
+                      {item.tags?.length > 0 && (
+                        <p className="meta">tags: {item.tags.join(", ")}</p>
+                      )}
+                      {item.bestSnippet && (
+                        <p
+                          className="snippet"
+                          dangerouslySetInnerHTML={{ __html: item.bestSnippet }}
+                        />
+                      )}
+                      {searchResult?.debug?.enabled && (
+                        <div className="score-row">
+                          <span>keyword {formatScore(item.keywordScore)}</span>
+                          <span>vector {formatScore(item.vectorScore)}</span>
+                          <span>final {formatScore(item.finalScore)}</span>
+                        </div>
+                      )}
+                      <div className="search-actions">
                         <button
                           type="button"
                           className="ghost"
-                          onClick={() => openDocumentViewer(item)}
+                          onClick={() => loadResourceContent(item)}
                         >
-                          PDF 열기
+                          본문 보기
                         </button>
-                      )}
-                      {item.type === "link" && item.url && (
-                        <button
-                          type="button"
-                          className="ghost"
-                          onClick={() => openLinkSource(item)}
-                        >
-                          원문 열기
-                        </button>
-                      )}
-                    </div>
-                  </li>
-                ))}
+                        {item.type === "document" && (
+                          <button
+                            type="button"
+                            className="ghost"
+                            onClick={() => openDocumentViewerFromSearch(item)}
+                          >
+                            PDF 열기
+                          </button>
+                        )}
+                        {item.type === "link" && item.url && (
+                          <button
+                            type="button"
+                            className="ghost"
+                            onClick={() => openLinkSource(item)}
+                          >
+                            원문 열기
+                          </button>
+                        )}
+                      </div>
+                    </li>
+                  );
+                })}
               </ul>
             )}
 
@@ -868,6 +1037,146 @@ export default function App() {
             </div>
           </section>
         </section>
+      )}
+
+      {workspace === "search" && contentTarget && (
+        <div
+          className="content-drawer-backdrop"
+          onClick={closeContentViewer}
+          role="presentation"
+        >
+          <aside
+            className="content-drawer"
+            role="dialog"
+            aria-modal="true"
+            aria-label="본문 뷰어"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="content-drawer-head">
+              <div>
+                <h3>본문 뷰어</h3>
+                <p className="meta">
+                  {contentResult.title || contentTarget.title || "(제목 없음)"}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="ghost"
+                onClick={closeContentViewer}
+              >
+                닫기
+              </button>
+            </div>
+
+            <div className="content-drawer-body">
+              {contentLoading && <p className="muted">본문 불러오는 중...</p>}
+              {contentError && <p className="error-msg">{contentError}</p>}
+
+              {!contentLoading && !contentError && (
+                <div className="content-view">
+                  <div className="content-head">
+                    <div>
+                      <p className="meta">
+                        #{contentTarget.resourceId} · {contentTarget.type} · chunk {contentResult.chunkCount}
+                      </p>
+                    </div>
+                    <div className="search-actions">
+                      {contentTarget.type === "document" && (
+                        <button
+                          type="button"
+                          className="ghost"
+                          onClick={() =>
+                            openDocumentViewer(contentTarget, {
+                              pageIndexBase: contentPageIndexBase
+                            })
+                          }
+                        >
+                          PDF 열기
+                        </button>
+                      )}
+                      {contentTarget.type === "link" && contentTarget.url && (
+                        <button
+                          type="button"
+                          className="ghost"
+                          onClick={() => openLinkSource(contentTarget)}
+                        >
+                          원문 열기
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="content-tabs">
+                    <button
+                      type="button"
+                      className={contentTab === "matched" ? "active" : ""}
+                      onClick={() => setContentTab("matched")}
+                    >
+                      일치 청크 ({matchedChunks.length})
+                    </button>
+                    <button
+                      type="button"
+                      className={contentTab === "all" ? "active" : ""}
+                      onClick={() => setContentTab("all")}
+                    >
+                      전체 본문 ({contentResult.chunkCount})
+                    </button>
+                  </div>
+
+                  {visibleChunks.length === 0 ? (
+                    <p className="muted">
+                      {contentTab === "matched"
+                        ? "검색어와 일치하는 청크가 없습니다."
+                        : "표시할 본문 청크가 없습니다."}
+                    </p>
+                  ) : (
+                    <ul className="chunk-list">
+                      {visibleChunks.map((chunk, index) => (
+                        <li
+                          key={`${chunk.position ?? "p"}-${chunk.pageIndex ?? "n"}-${index}`}
+                          className="chunk-item"
+                        >
+                          <div className="chunk-meta-row">
+                            <span className="meta">
+                              page {toDisplayPageNumber(chunk.pageIndex, contentPageIndexBase) ?? "-"} ·
+                              pos {typeof chunk.position === "number" ? chunk.position : "-"}
+                            </span>
+                            <div className="chunk-meta-actions">
+                              {chunk.matched && <span className="badge small">match</span>}
+                              {contentTarget.type === "document" && typeof chunk.pageIndex === "number" && (
+                                <button
+                                  type="button"
+                                  className="ghost chunk-open"
+                                  onClick={() =>
+                                    openDocumentViewer(contentTarget, {
+                                      pageIndex: chunk.pageIndex,
+                                      query: "",
+                                      pageIndexBase: contentPageIndexBase
+                                    })
+                                  }
+                                >
+                                  이 페이지 열기
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                          {chunk.highlightedText ? (
+                            <p
+                              className="snippet"
+                              dangerouslySetInnerHTML={{ __html: chunk.highlightedText }}
+                            />
+                          ) : (
+                            <p className="chunk-text">{chunk.text}</p>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+            </div>
+          </aside>
+        </div>
       )}
     </div>
   );
