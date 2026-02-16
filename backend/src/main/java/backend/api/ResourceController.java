@@ -1,8 +1,16 @@
 package backend.api;
 
 import backend.resource.ResourceService;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
+import org.springframework.http.ContentDisposition;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+
+import java.nio.charset.StandardCharsets;
 
 @RestController
 @RequestMapping("/api/resources")
@@ -23,6 +31,31 @@ public class ResourceController {
         }
     }
 
+    @GetMapping("/{resourceId}/file")
+    public ResponseEntity<Resource> openFile(@PathVariable long resourceId) {
+        ResourceService.DocumentFile doc = resourceService.findDocumentFile(resourceId)
+                .orElseThrow(() -> new ResourceNotFoundException(resourceId));
+
+        MediaType mediaType = MediaType.APPLICATION_OCTET_STREAM;
+        if (doc.mimeType() != null && !doc.mimeType().isBlank()) {
+            try {
+                mediaType = MediaType.parseMediaType(doc.mimeType());
+            } catch (Exception ignored) {
+                mediaType = MediaType.APPLICATION_OCTET_STREAM;
+            }
+        }
+
+        ContentDisposition contentDisposition = ContentDisposition.inline()
+                .filename(doc.filename(), StandardCharsets.UTF_8)
+                .build();
+
+        return ResponseEntity.ok()
+                .contentType(mediaType)
+                .contentLength(doc.size())
+                .header(HttpHeaders.CONTENT_DISPOSITION, contentDisposition.toString())
+                .body(new FileSystemResource(doc.filePath()));
+    }
+
     @ResponseStatus(HttpStatus.NOT_FOUND)
     private static class ResourceNotFoundException extends RuntimeException {
         ResourceNotFoundException(long resourceId) {
@@ -30,4 +63,3 @@ public class ResourceController {
         }
     }
 }
-

@@ -319,6 +319,13 @@ button[type="submit"]:not([disabled]):hover {
   background: #fbfdff;
 }
 
+.search-actions {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .search-head {
   display: flex;
   align-items: center;
