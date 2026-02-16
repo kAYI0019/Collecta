@@ -1,20 +1,22 @@
 spring:
+  task:
+    scheduling:
+      enabled: false # tests call scheduled methods directly to avoid flakiness
+
   flyway:
-    enabled: false
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+    validate-on-migrate: false
+    clean-disabled: true
 
   jpa:
     hibernate:
-      ddl-auto: create-drop
-    properties:
-      hibernate:
-        dialect: org.hibernate.dialect.PostgreSQLDialect
+      ddl-auto: validate
     show-sql: false
 
-  datasource:
-    url: jdbc:postgresql://localhost:5432/collecta
-    username: collecta
-    password: collecta_pw
-    driver-class-name: org.postgresql.Driver
+storage:
+  base-path: build/test-uploads
 
 elasticsearch:
   host: localhost
@@ -24,4 +26,3 @@ elasticsearch:
 logging:
   level:
     org.hibernate.SQL: WARN
-

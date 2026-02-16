@@ -1,10 +1,12 @@
 package backend;
 
 import org.junit.jupiter.api.Test;
-import org.springframework.boot.test.context.SpringBootTest;
+import org.junit.jupiter.api.Tag;
 
-@SpringBootTest
-class BackendApplicationTests {
+import backend.test.IntegrationTestBase;
+
+@Tag("it")
+class BackendApplicationTests extends IntegrationTestBase {
 
 	@Test
 	void contextLoads() {
