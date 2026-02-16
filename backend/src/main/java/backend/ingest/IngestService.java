@@ -20,6 +20,7 @@ import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Stream;
 
 @Service
@@ -183,6 +184,74 @@ public class IngestService {
         return resource.id();
     }
 
+    @Transactional
+    public RetryResult retryIngest(long resourceId) {
+        Optional<ResourceSnapshot> snapshotOpt = findResourceSnapshot(resourceId);
+        if (snapshotOpt.isEmpty()) {
+            return RetryResult.NOT_FOUND;
+        }
+
+        int updated = jdbc.update(
+                """
+                UPDATE ingest_jobs
+                SET status = 'queued',
+                    stage = NULL,
+                    total_units = NULL,
+                    processed_units = NULL,
+                    error_message = NULL,
+                    updated_at = NOW()
+                WHERE resource_id = ?
+                  AND status IN ('failed', 'cancelled')
+                """,
+                resourceId
+        );
+        if (updated == 0) {
+            return RetryResult.NOT_RETRYABLE;
+        }
+
+        ResourceSnapshot snapshot = snapshotOpt.get();
+        List<String> tags = findTagsByResourceId(resourceId);
+        if ("document".equals(snapshot.resourceType())) {
+            String filePath = snapshot.filePath();
+            if (filePath == null || filePath.isBlank()) {
+                throw new IllegalStateException("document file_path is missing: " + resourceId);
+            }
+            publishIndexEvent(
+                    new ResourceRow(snapshot.resourceId(), snapshot.createdAt()),
+                    "document",
+                    null,
+                    tags,
+                    snapshot.status(),
+                    snapshot.isPinned(),
+                    Map.of(
+                            "file_path", filePath,
+                            "mime_type", snapshot.mimeType() == null ? "application/octet-stream" : snapshot.mimeType(),
+                            "file_name", extractFileName(filePath)
+                    ),
+                    null
+            );
+        } else if ("link".equals(snapshot.resourceType())) {
+            publishIndexEvent(
+                    new ResourceRow(snapshot.resourceId(), snapshot.createdAt()),
+                    "link",
+                    snapshot.domain(),
+                    tags,
+                    snapshot.status(),
+                    snapshot.isPinned(),
+                    null,
+                    Map.of(
+                            "title", snapshot.title(),
+                            "memo", snapshot.memo() == null ? "" : snapshot.memo(),
+                            "tags", tags
+                    )
+            );
+        } else {
+            throw new IllegalStateException("unsupported resource type: " + snapshot.resourceType());
+        }
+
+        return RetryResult.RETRIED;
+    }
+
     private ResourceRow insertResource(String type, String title, String memo, String status, boolean isPinned) {
         return jdbc.queryForObject(
                 """
@@ -317,6 +386,70 @@ public class IngestService {
         return ids.isEmpty() ? null : ids.get(0);
     }
 
+    private Optional<ResourceSnapshot> findResourceSnapshot(long resourceId) {
+        List<ResourceSnapshot> rows = jdbc.query(
+                """
+                SELECT r.id,
+                       r.type,
+                       r.title,
+                       r.memo,
+                       r.status,
+                       r.is_pinned,
+                       r.created_at,
+                       l.domain,
+                       d.file_path,
+                       d.mime_type
+                FROM resources r
+                LEFT JOIN links l ON l.resource_id = r.id
+                LEFT JOIN documents d ON d.resource_id = r.id
+                WHERE r.id = ?
+                """,
+                (rs, rowNum) -> new ResourceSnapshot(
+                        rs.getLong("id"),
+                        rs.getString("type"),
+                        rs.getString("title"),
+                        rs.getString("memo"),
+                        rs.getString("status"),
+                        rs.getBoolean("is_pinned"),
+                        rs.getObject("created_at", OffsetDateTime.class),
+                        rs.getString("domain"),
+                        rs.getString("file_path"),
+                        rs.getString("mime_type")
+                ),
+                resourceId
+        );
+        if (rows.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(rows.get(0));
+    }
+
+    private List<String> findTagsByResourceId(long resourceId) {
+        return jdbc.query(
+                """
+                SELECT t.name
+                FROM resource_tags rt
+                JOIN tags t ON t.id = rt.tag_id
+                WHERE rt.resource_id = ?
+                ORDER BY t.name
+                """,
+                (rs, rowNum) -> rs.getString("name"),
+                resourceId
+        );
+    }
+
+    private static String extractFileName(String filePath) {
+        try {
+            Path p = Path.of(filePath);
+            Path name = p.getFileName();
+            if (name != null && !name.toString().isBlank()) {
+                return name.toString();
+            }
+        } catch (Exception ignored) {
+        }
+        return "original";
+    }
+
     private static SavedFile saveAndDigest(MultipartFile file, Path dest) {
         MessageDigest digest;
         try {
@@ -367,6 +500,19 @@ public class IngestService {
 
     private record SavedFile(long size, String sha256) {}
     public record DocumentIngestResult(long resourceId, boolean deduplicated) {}
+    public enum RetryResult { RETRIED, NOT_FOUND, NOT_RETRYABLE }
 
     private record ResourceRow(long id, OffsetDateTime createdAt) {}
+    private record ResourceSnapshot(
+            long resourceId,
+            String resourceType,
+            String title,
+            String memo,
+            String status,
+            boolean isPinned,
+            OffsetDateTime createdAt,
+            String domain,
+            String filePath,
+            String mimeType
+    ) {}
 }

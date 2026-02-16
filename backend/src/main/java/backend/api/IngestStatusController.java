@@ -1,5 +1,6 @@
 package backend.api;
 
+import backend.ingest.IngestService;
 import backend.ingest.IngestStatusService;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.*;
@@ -11,9 +12,11 @@ import java.util.List;
 public class IngestStatusController {
 
     private final IngestStatusService ingestStatusService;
+    private final IngestService ingestService;
 
-    public IngestStatusController(IngestStatusService ingestStatusService) {
+    public IngestStatusController(IngestStatusService ingestStatusService, IngestService ingestService) {
         this.ingestStatusService = ingestStatusService;
+        this.ingestService = ingestService;
     }
 
     @GetMapping("/{resourceId}")
@@ -54,10 +57,30 @@ public class IngestStatusController {
                 .orElseThrow(() -> new StatusNotFoundException(resourceId));
     }
 
+    @PostMapping("/{resourceId}/retry")
+    public IngestStatusService.IngestStatus retry(@PathVariable long resourceId) {
+        IngestService.RetryResult result = ingestService.retryIngest(resourceId);
+        if (result == IngestService.RetryResult.NOT_FOUND) {
+            throw new StatusNotFoundException(resourceId);
+        }
+        if (result == IngestService.RetryResult.NOT_RETRYABLE) {
+            throw new RetryNotAllowedException(resourceId);
+        }
+        return ingestStatusService.findByResourceId(resourceId)
+                .orElseThrow(() -> new StatusNotFoundException(resourceId));
+    }
+
     @ResponseStatus(HttpStatus.NOT_FOUND)
     private static class StatusNotFoundException extends RuntimeException {
         StatusNotFoundException(long resourceId) {
             super("ingest status not found: " + resourceId);
+        }
+    }
+
+    @ResponseStatus(HttpStatus.CONFLICT)
+    private static class RetryNotAllowedException extends RuntimeException {
+        RetryNotAllowedException(long resourceId) {
+            super("ingest job is not retryable: " + resourceId);
         }
     }
 

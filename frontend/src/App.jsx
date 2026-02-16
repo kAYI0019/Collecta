@@ -94,6 +94,8 @@ export default function App() {
         return "완료";
       case "cancelled":
         return "취소";
+      case "timeout":
+        return "시간초과";
       default:
         return value || "-";
     }
@@ -163,6 +165,23 @@ export default function App() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.message || "취소 실패");
+      setSelected(data);
+      fetchRecent();
+    } catch (err) {
+      setSelected({ error: err.message });
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  const retryIngest = async (resourceId) => {
+    setDetailLoading(true);
+    try {
+      const res = await fetch(`/api/ingest/${resourceId}/retry`, {
+        method: "POST"
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.message || "재시도 실패");
       setSelected(data);
       fetchRecent();
     } catch (err) {
@@ -330,6 +349,25 @@ export default function App() {
     if (nextPage < 0) return;
     if (nextPage >= searchResult.totalPages) return;
     await runSearch(nextPage);
+  };
+
+  const openDocumentViewer = (item) => {
+    const hash = new URLSearchParams();
+    if (typeof item.bestPageIndex === "number" && item.bestPageIndex >= 0) {
+      hash.set("page", String(item.bestPageIndex + 1));
+    }
+    if (search.q?.trim()) {
+      hash.set("search", search.q.trim());
+    }
+
+    const baseUrl = `/api/resources/${item.resourceId}/file`;
+    const target = hash.toString() ? `${baseUrl}#${hash.toString()}` : baseUrl;
+    window.open(target, "_blank", "noopener,noreferrer");
+  };
+
+  const openLinkSource = (item) => {
+    if (!item?.url) return;
+    window.open(item.url, "_blank", "noopener,noreferrer");
   };
 
   return (
@@ -588,6 +626,16 @@ export default function App() {
                         업로드 중단
                       </button>
                     )}
+                    {(selected.status === "failed" || selected.status === "cancelled") && (
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() => retryIngest(selected.resourceId)}
+                        disabled={detailLoading}
+                      >
+                        재시도
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="danger"
@@ -752,6 +800,9 @@ export default function App() {
                     <p className="meta">
                       #{item.resourceId} · score {formatScore(item.bestScore)} · match {item.matchCount}
                     </p>
+                    {typeof item.bestPageIndex === "number" && item.bestPageIndex >= 0 && (
+                      <p className="meta">best page: {item.bestPageIndex + 1}</p>
+                    )}
                     {item.tags?.length > 0 && (
                       <p className="meta">tags: {item.tags.join(", ")}</p>
                     )}
@@ -768,6 +819,26 @@ export default function App() {
                         <span>final {formatScore(item.finalScore)}</span>
                       </div>
                     )}
+                    <div className="search-actions">
+                      {item.type === "document" && (
+                        <button
+                          type="button"
+                          className="ghost"
+                          onClick={() => openDocumentViewer(item)}
+                        >
+                          PDF 열기
+                        </button>
+                      )}
+                      {item.type === "link" && item.url && (
+                        <button
+                          type="button"
+                          className="ghost"
+                          onClick={() => openLinkSource(item)}
+                        >
+                          원문 열기
+                        </button>
+                      )}
+                    </div>
                   </li>
                 ))}
               </ul>
