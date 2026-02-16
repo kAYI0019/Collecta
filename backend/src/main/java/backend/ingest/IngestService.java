@@ -211,45 +211,73 @@ public class IngestService {
 
         ResourceSnapshot snapshot = snapshotOpt.get();
         List<String> tags = findTagsByResourceId(resourceId);
-        if ("document".equals(snapshot.resourceType())) {
-            String filePath = snapshot.filePath();
-            if (filePath == null || filePath.isBlank()) {
-                throw new IllegalStateException("document file_path is missing: " + resourceId);
-            }
-            publishIndexEvent(
-                    new ResourceRow(snapshot.resourceId(), snapshot.createdAt()),
-                    "document",
-                    null,
-                    tags,
-                    snapshot.status(),
-                    snapshot.isPinned(),
-                    Map.of(
-                            "file_path", filePath,
-                            "mime_type", snapshot.mimeType() == null ? "application/octet-stream" : snapshot.mimeType(),
-                            "file_name", extractFileName(filePath)
-                    ),
-                    null
-            );
-        } else if ("link".equals(snapshot.resourceType())) {
-            publishIndexEvent(
-                    new ResourceRow(snapshot.resourceId(), snapshot.createdAt()),
-                    "link",
-                    snapshot.domain(),
-                    tags,
-                    snapshot.status(),
-                    snapshot.isPinned(),
-                    null,
-                    Map.of(
-                            "title", snapshot.title(),
-                            "memo", snapshot.memo() == null ? "" : snapshot.memo(),
-                            "tags", tags
-                    )
-            );
-        } else {
-            throw new IllegalStateException("unsupported resource type: " + snapshot.resourceType());
-        }
+        publishIndexEventForSnapshot(snapshot, tags);
 
         return RetryResult.RETRIED;
+    }
+
+    @Transactional
+    public ForceReindexResult forceReindex(long resourceId) {
+        Optional<ResourceSnapshot> snapshotOpt = findResourceSnapshot(resourceId);
+        if (snapshotOpt.isEmpty()) {
+            return ForceReindexResult.NOT_FOUND;
+        }
+
+        ResourceSnapshot snapshot = snapshotOpt.get();
+        int queued = jdbc.update(
+                """
+                INSERT INTO ingest_jobs (resource_id, resource_type, title, status, stage, total_units, processed_units, error_message)
+                VALUES (?, ?, ?, 'queued', NULL, NULL, NULL, NULL)
+                ON CONFLICT (resource_id) DO UPDATE
+                SET status = 'queued',
+                    stage = NULL,
+                    total_units = NULL,
+                    processed_units = NULL,
+                    error_message = NULL,
+                    updated_at = NOW()
+                WHERE ingest_jobs.status <> 'processing'
+                """,
+                snapshot.resourceId(),
+                snapshot.resourceType(),
+                snapshot.title()
+        );
+        if (queued == 0) {
+            return ForceReindexResult.IN_PROGRESS;
+        }
+
+        List<String> tags = findTagsByResourceId(resourceId);
+        publishIndexEventForSnapshot(snapshot, tags);
+        return ForceReindexResult.REINDEXED;
+    }
+
+    @Transactional
+    public ReindexLinksBatchResult forceReindexLinks(int limit) {
+        int safeLimit = Math.max(1, Math.min(limit, 1000));
+        List<Long> linkIds = jdbc.query(
+                """
+                SELECT r.id
+                FROM resources r
+                LEFT JOIN ingest_jobs j ON j.resource_id = r.id
+                WHERE r.type = 'link'
+                  AND (j.status IS NULL OR j.status <> 'processing')
+                ORDER BY r.id
+                LIMIT ?
+                """,
+                (rs, rowNum) -> rs.getLong("id"),
+                safeLimit
+        );
+
+        int enqueued = 0;
+        int skipped = 0;
+        for (Long linkId : linkIds) {
+            ForceReindexResult result = forceReindex(linkId);
+            if (result == ForceReindexResult.REINDEXED) {
+                enqueued++;
+            } else {
+                skipped++;
+            }
+        }
+        return new ReindexLinksBatchResult(linkIds.size(), enqueued, skipped);
     }
 
     private ResourceRow insertResource(String type, String title, String memo, String status, boolean isPinned) {
@@ -498,9 +526,55 @@ public class IngestService {
         }
     }
 
+    private void publishIndexEventForSnapshot(ResourceSnapshot snapshot, List<String> tags) {
+        if ("document".equals(snapshot.resourceType())) {
+            String filePath = snapshot.filePath();
+            if (filePath == null || filePath.isBlank()) {
+                throw new IllegalStateException("document file_path is missing: " + snapshot.resourceId());
+            }
+            publishIndexEvent(
+                    new ResourceRow(snapshot.resourceId(), snapshot.createdAt()),
+                    "document",
+                    null,
+                    tags,
+                    snapshot.status(),
+                    snapshot.isPinned(),
+                    Map.of(
+                            "file_path", filePath,
+                            "mime_type", snapshot.mimeType() == null ? "application/octet-stream" : snapshot.mimeType(),
+                            "file_name", extractFileName(filePath)
+                    ),
+                    null
+            );
+            return;
+        }
+
+        if ("link".equals(snapshot.resourceType())) {
+            publishIndexEvent(
+                    new ResourceRow(snapshot.resourceId(), snapshot.createdAt()),
+                    "link",
+                    snapshot.domain(),
+                    tags,
+                    snapshot.status(),
+                    snapshot.isPinned(),
+                    null,
+                    Map.of(
+                            "title", snapshot.title(),
+                            "memo", snapshot.memo() == null ? "" : snapshot.memo(),
+                            "tags", tags
+                    )
+            );
+            return;
+        }
+
+        throw new IllegalStateException("unsupported resource type: " + snapshot.resourceType());
+    }
+
     private record SavedFile(long size, String sha256) {}
     public record DocumentIngestResult(long resourceId, boolean deduplicated) {}
     public enum RetryResult { RETRIED, NOT_FOUND, NOT_RETRYABLE }
+    public enum ForceReindexResult { REINDEXED, NOT_FOUND, IN_PROGRESS }
+    public record ReindexLinksBatchResult(int selected, int enqueued, int skipped) {}
 
     private record ResourceRow(long id, OffsetDateTime createdAt) {}
     private record ResourceSnapshot(

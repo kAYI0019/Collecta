@@ -70,6 +70,27 @@ public class IngestStatusController {
                 .orElseThrow(() -> new StatusNotFoundException(resourceId));
     }
 
+    @PostMapping("/{resourceId}/reindex")
+    public IngestStatusService.IngestStatus reindex(@PathVariable long resourceId) {
+        IngestService.ForceReindexResult result = ingestService.forceReindex(resourceId);
+        if (result == IngestService.ForceReindexResult.NOT_FOUND) {
+            throw new StatusNotFoundException(resourceId);
+        }
+        if (result == IngestService.ForceReindexResult.IN_PROGRESS) {
+            throw new ReindexNotAllowedException(resourceId);
+        }
+        return ingestStatusService.findByResourceId(resourceId)
+                .orElseThrow(() -> new StatusNotFoundException(resourceId));
+    }
+
+    @PostMapping("/reindex-links")
+    public ReindexLinksResponse reindexLinks(
+            @RequestParam(defaultValue = "200") int limit
+    ) {
+        IngestService.ReindexLinksBatchResult result = ingestService.forceReindexLinks(limit);
+        return new ReindexLinksResponse(result.selected(), result.enqueued(), result.skipped());
+    }
+
     @ResponseStatus(HttpStatus.NOT_FOUND)
     private static class StatusNotFoundException extends RuntimeException {
         StatusNotFoundException(long resourceId) {
@@ -84,6 +105,13 @@ public class IngestStatusController {
         }
     }
 
+    @ResponseStatus(HttpStatus.CONFLICT)
+    private static class ReindexNotAllowedException extends RuntimeException {
+        ReindexNotAllowedException(long resourceId) {
+            super("ingest job is in progress: " + resourceId);
+        }
+    }
+
     public record StatusUpdateRequest(long resourceId, String status, String errorMessage) {}
 
     public record ProgressUpdateRequest(
@@ -91,5 +119,11 @@ public class IngestStatusController {
             String stage,
             Integer totalUnits,
             Integer processedUnits
+    ) {}
+
+    public record ReindexLinksResponse(
+            int selected,
+            int enqueued,
+            int skipped
     ) {}
 }
