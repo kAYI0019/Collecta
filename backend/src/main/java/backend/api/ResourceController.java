@@ -1,5 +1,6 @@
 package backend.api;
 
+import backend.resource.ResourceContentService;
 import backend.resource.ResourceService;
 import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
@@ -17,9 +18,14 @@ import java.nio.charset.StandardCharsets;
 public class ResourceController {
 
     private final ResourceService resourceService;
+    private final ResourceContentService resourceContentService;
 
-    public ResourceController(ResourceService resourceService) {
+    public ResourceController(
+            ResourceService resourceService,
+            ResourceContentService resourceContentService
+    ) {
         this.resourceService = resourceService;
+        this.resourceContentService = resourceContentService;
     }
 
     @DeleteMapping("/{resourceId}")
@@ -54,6 +60,15 @@ public class ResourceController {
                 .contentLength(doc.size())
                 .header(HttpHeaders.CONTENT_DISPOSITION, contentDisposition.toString())
                 .body(new FileSystemResource(doc.filePath()));
+    }
+
+    @GetMapping("/{resourceId}/content")
+    public ResourceContentService.ResourceContentResponse getContent(
+            @PathVariable long resourceId,
+            @RequestParam(required = false) String q
+    ) throws Exception {
+        return resourceContentService.findResourceContent(resourceId, q)
+                .orElseThrow(() -> new ResourceNotFoundException(resourceId));
     }
 
     @ResponseStatus(HttpStatus.NOT_FOUND)
