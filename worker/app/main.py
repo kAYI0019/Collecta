@@ -664,8 +664,16 @@ def process_link(req: IndexLinkRequest, progress_enabled: bool = False):
     if not isinstance(link_tags, list):
         link_tags = []
 
-    # MVP: title + memo + tags를 하나의 chunk_text로
-    chunk_text = normalize_text(" ".join([title, memo, " ".join(link_tags)]).strip())
+    # 구조화된 링크 본문으로 저장해 가독성을 높입니다.
+    parts: List[str] = []
+    if title:
+        parts.append(f"제목: {title}")
+    if memo:
+        parts.append(f"메모: {memo}")
+    if link_tags:
+        parts.append(f"태그: {', '.join(str(t).strip() for t in link_tags if str(t).strip())}")
+
+    chunk_text = normalize_text("\n".join(parts))
     if not chunk_text:
         return {
             "job_id": req.job_id,
