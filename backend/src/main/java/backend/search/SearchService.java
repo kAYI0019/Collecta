@@ -56,7 +56,7 @@ public class SearchService {
             String q,
             String resourceType,
             String domain,
-            String status,
+            List<String> statuses,
             Boolean isPinned,
             List<String> tags,
             int page,
@@ -70,6 +70,8 @@ public class SearchService {
         String effectiveMode = normalizeMode(mode);
         int safePage = clampNonNeg(page);
         int safePageSize = clampPageSize(pageSize);
+        List<String> safeStatuses = sanitizeStatuses(statuses);
+        String statusForLog = safeStatuses.isEmpty() ? null : String.join(",", safeStatuses);
 
         if (q == null || q.isBlank()) {
             SearchResponseDto empty = new SearchResponseDto(
@@ -86,7 +88,7 @@ public class SearchService {
                         effectiveMode,
                         resourceType,
                         domain,
-                        status,
+                        statusForLog,
                         isPinned,
                         tags,
                         sort,
@@ -110,13 +112,13 @@ public class SearchService {
         SearchRunResult runResult;
         switch (effectiveMode) {
             case "semantic" -> runResult = runSemantic(
-                    q, queryVector, resourceType, domain, status, isPinned, tags, safePage, safePageSize, sort
+                    q, queryVector, resourceType, domain, safeStatuses, isPinned, tags, safePage, safePageSize, sort
             );
             case "hybrid" -> runResult = runHybrid(
-                    q, queryVector, resourceType, domain, status, isPinned, tags, safePage, safePageSize, sort
+                    q, queryVector, resourceType, domain, safeStatuses, isPinned, tags, safePage, safePageSize, sort
             );
             default -> runResult = runKeyword(
-                    q, resourceType, domain, status, isPinned, tags, safePage, safePageSize, sort
+                    q, resourceType, domain, safeStatuses, isPinned, tags, safePage, safePageSize, sort
             );
         }
 
@@ -214,7 +216,7 @@ public class SearchService {
                     effectiveMode,
                     resourceType,
                     domain,
-                    status,
+                    statusForLog,
                     isPinned,
                     tags,
                     sort,
@@ -232,7 +234,7 @@ public class SearchService {
             String q,
             String resourceType,
             String domain,
-            String status,
+            List<String> statuses,
             Boolean isPinned,
             List<String> tags,
             int page,
@@ -243,7 +245,7 @@ public class SearchService {
 
         Query query = Query.of(qb -> qb.bool(b -> {
             b.must(m -> m.match(mm -> mm.field("chunk_text").query(q)));
-            applyFilters(b, resourceType, domain, status, isPinned, tags);
+            applyFilters(b, resourceType, domain, statuses, isPinned, tags);
             return b;
         }));
 
@@ -267,7 +269,7 @@ public class SearchService {
             List<Double> queryVector,
             String resourceType,
             String domain,
-            String status,
+            List<String> statuses,
             Boolean isPinned,
             List<String> tags,
             int page,
@@ -284,7 +286,7 @@ public class SearchService {
                             .params("query_vector", JsonData.of(queryVector))
                     )
             ));
-            applyFilters(b, resourceType, domain, status, isPinned, tags);
+            applyFilters(b, resourceType, domain, statuses, isPinned, tags);
             return b;
         }));
 
@@ -308,7 +310,7 @@ public class SearchService {
             List<Double> queryVector,
             String resourceType,
             String domain,
-            String status,
+            List<String> statuses,
             Boolean isPinned,
             List<String> tags,
             int page,
@@ -319,7 +321,7 @@ public class SearchService {
 
         Query keywordQuery = Query.of(qb -> qb.bool(b -> {
             b.must(m -> m.match(mm -> mm.field("chunk_text").query(q)));
-            applyFilters(b, resourceType, domain, status, isPinned, tags);
+            applyFilters(b, resourceType, domain, statuses, isPinned, tags);
             return b;
         }));
 
@@ -534,7 +536,7 @@ public class SearchService {
             BoolQuery.Builder b,
             String resourceType,
             String domain,
-            String status,
+            List<String> statuses,
             Boolean isPinned,
             List<String> tags
     ) {
@@ -544,8 +546,10 @@ public class SearchService {
         if (domain != null && !domain.isBlank()) {
             b.filter(f -> f.term(t -> t.field("domain").value(domain)));
         }
-        if (status != null && !status.isBlank()) {
-            b.filter(f -> f.term(t -> t.field("status").value(status)));
+        if (statuses != null && !statuses.isEmpty()) {
+            b.filter(f -> f.terms(t -> t.field("status").terms(tt -> tt.value(
+                    statuses.stream().map(FieldValue::of).toList()
+            ))));
         }
         if (isPinned != null) {
             b.filter(f -> f.term(t -> t.field("is_pinned").value(isPinned)));
@@ -555,6 +559,15 @@ public class SearchService {
                     tags.stream().map(FieldValue::of).toList()
             ))));
         }
+    }
+
+    private static List<String> sanitizeStatuses(List<String> statuses) {
+        if (statuses == null || statuses.isEmpty()) return List.of();
+        return statuses.stream()
+                .map(s -> s == null ? "" : s.trim().toLowerCase())
+                .filter(s -> !s.isBlank())
+                .distinct()
+                .toList();
     }
 
     private PagedResponse<GroupedSearchResultDto> groupAndPage(

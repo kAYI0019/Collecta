@@ -22,6 +22,7 @@ public class SearchController {
             @RequestParam(required = false) String resourceType,
             @RequestParam(required = false) String domain,
             @RequestParam(required = false) String status,
+            @RequestParam(required = false) String statuses,
             @RequestParam(required = false) Boolean isPinned,
             @RequestParam(required = false) String tags,
             @RequestParam(required = false, defaultValue = "keyword") String mode,
@@ -31,12 +32,26 @@ public class SearchController {
             @RequestParam(defaultValue = "20") int pageSize,
             @RequestParam(defaultValue = "relevance") String sort
     ) throws Exception {
+        List<String> statusList = parseCsv(statuses);
+        if (statusList.isEmpty()) {
+            statusList = parseCsv(status);
+        }
+
         List<String> tagList = (tags == null || tags.isBlank())
                 ? List.of()
                 : List.of(tags.split("\\s*,\\s*"));
 
         return searchService.searchResourceCards(
-                q, resourceType, domain, status, isPinned, tagList, page, pageSize, sort, mode, debug, log
+                q, resourceType, domain, statusList, isPinned, tagList, page, pageSize, sort, mode, debug, log
         );
+    }
+
+    private static List<String> parseCsv(String raw) {
+        if (raw == null || raw.isBlank()) return List.of();
+        return List.of(raw.split("\\s*,\\s*")).stream()
+                .map(v -> v == null ? "" : v.trim())
+                .filter(v -> !v.isBlank())
+                .distinct()
+                .toList();
     }
 }
