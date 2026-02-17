@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 
 const defaultDoc = {
   title: "",
@@ -48,6 +48,17 @@ const emptyResourceContent = {
   chunks: []
 };
 
+const emptyResourceEditForm = {
+  resourceId: null,
+  type: "document",
+  title: "",
+  memo: "",
+  tags: "",
+  status: "todo",
+  isPinned: false,
+  url: ""
+};
+
 export default function App() {
   const [workspace, setWorkspace] = useState("upload");
 
@@ -58,6 +69,27 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [recent, setRecent] = useState([]);
   const [recentLoading, setRecentLoading] = useState(false);
+  const [uploadingDocs, setUploadingDocs] = useState([]);
+  const [uploadingLoading, setUploadingLoading] = useState(false);
+  const [uploadingError, setUploadingError] = useState(null);
+  const [resourceStatusFilter, setResourceStatusFilter] = useState("active");
+  const [resourceTypeFilter, setResourceTypeFilter] = useState("");
+  const [resourcePinnedFilter, setResourcePinnedFilter] = useState("all");
+  const [resourceFilterOpen, setResourceFilterOpen] = useState(false);
+  const [resourceSearchInput, setResourceSearchInput] = useState("");
+  const [resourceSearchQuery, setResourceSearchQuery] = useState("");
+  const [resourcePage, setResourcePage] = useState(0);
+  const [resourceTotal, setResourceTotal] = useState(0);
+  const [resourceTotalPages, setResourceTotalPages] = useState(0);
+  const [resourceError, setResourceError] = useState(null);
+  const [statusMenuResourceId, setStatusMenuResourceId] = useState(null);
+  const [statusUpdatingId, setStatusUpdatingId] = useState(null);
+  const [resourceEditOpen, setResourceEditOpen] = useState(false);
+  const [resourceEditForm, setResourceEditForm] = useState(emptyResourceEditForm);
+  const [resourceEditSaving, setResourceEditSaving] = useState(false);
+  const [resourceEditError, setResourceEditError] = useState(null);
+  const [memoViewer, setMemoViewer] = useState(null);
+  const [resourceDetailOpen, setResourceDetailOpen] = useState(false);
   const [selected, setSelected] = useState(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [docDetailsOpen, setDocDetailsOpen] = useState(false);
@@ -73,6 +105,7 @@ export default function App() {
   const [contentError, setContentError] = useState(null);
   const [contentTab, setContentTab] = useState("matched");
   const [resourcePageIndexBaseMap, setResourcePageIndexBaseMap] = useState({});
+  const resourceFilterRef = useRef(null);
 
   const statusLabel = (value) => {
     switch (value) {
@@ -138,6 +171,109 @@ export default function App() {
     return Number(value).toFixed(4);
   };
 
+  const resourceStatusFilterLabel = (value) => {
+    switch (value) {
+      case "active":
+        return "할 일/진행중";
+      case "todo":
+        return "할 일";
+      case "in_progress":
+        return "진행중";
+      case "done":
+        return "완료";
+      default:
+        return "전체 자료";
+    }
+  };
+
+  const resourceTypeFilterLabel = (value) => {
+    switch (value) {
+      case "document":
+        return "문서";
+      case "link":
+        return "링크";
+      default:
+        return "전체 타입";
+    }
+  };
+
+  const resourcePinnedFilterLabel = (value) => {
+    switch (value) {
+      case "pinned":
+        return "중요만";
+      default:
+        return "전체";
+    }
+  };
+
+  const resourceStatusesParam = (value) => {
+    if (value === "active") return "todo,in_progress";
+    if (value === "all") return "";
+    return value || "";
+  };
+
+  const normalizeResourceSearchItems = (items) =>
+    (items || []).map((item) => ({
+      ...item,
+      type: item?.type || item?.resourceType || "-",
+      status: item?.status || "",
+      tags: Array.isArray(item?.tags) ? item.tags : []
+    }));
+
+  const resourceSearchActive = resourceSearchQuery.trim().length > 0;
+
+  const parseTagsInput = (raw) =>
+    (raw || "")
+      .split(",")
+      .map((tag) => tag.trim())
+      .filter(Boolean);
+
+  const toEditForm = (item) => ({
+    resourceId: item?.resourceId ?? null,
+    type: item?.type || item?.resourceType || "document",
+    title: item?.title || "",
+    memo: item?.memo ?? "",
+    tags: Array.isArray(item?.tags) ? item.tags.join(", ") : "",
+    status: item?.status || "todo",
+    isPinned: Boolean(item?.isPinned),
+    url: item?.url || ""
+  });
+
+  const applyResourceResponseToItem = (item, payload) => {
+    if (!payload) return item;
+    const next = { ...item };
+    if (typeof payload.resourceType === "string" && payload.resourceType) {
+      next.type = payload.resourceType;
+    }
+    if (typeof payload.title === "string") {
+      next.title = payload.title;
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "memo")) {
+      next.memo = payload.memo;
+    }
+    if (Array.isArray(payload.tags)) {
+      next.tags = payload.tags;
+    }
+    if (typeof payload.status === "string" && payload.status) {
+      next.status = payload.status;
+    }
+    if (typeof payload.isPinned === "boolean") {
+      next.isPinned = payload.isPinned;
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, "url")) {
+      next.url = payload.url;
+    }
+    return next;
+  };
+
+  const mergeUpdatedResource = (resourceId, payload) => {
+    setRecent((prev) =>
+      (prev || []).map((item) =>
+        item.resourceId === resourceId ? applyResourceResponseToItem(item, payload) : item
+      )
+    );
+  };
+
   const detectPageIndexBase = (chunks) => {
     const indices = (chunks || [])
       .map((chunk) => chunk?.pageIndex)
@@ -160,25 +296,180 @@ export default function App() {
     return pageNumber;
   };
 
-  const fetchRecent = async () => {
+  const fetchRecent = async (
+    targetPage = resourcePage,
+    targetStatus = resourceStatusFilter,
+    targetType = resourceTypeFilter,
+    targetPinned = resourcePinnedFilter,
+    targetQuery = resourceSearchQuery
+  ) => {
+    const safePage = Math.max(0, targetPage);
+    const safeQuery = (targetQuery || "").trim();
     setRecentLoading(true);
+    setResourceError(null);
+
+    const statusCsv = resourceStatusesParam(targetStatus);
+    const isPinnedParam = targetPinned === "pinned" ? "true" : "";
+
     try {
-      const res = await fetch("/api/ingest/recent?limit=20");
+      let endpoint = "/api/resources";
+      const params = new URLSearchParams();
+      params.set("page", String(safePage));
+      params.set("pageSize", "20");
+      if (statusCsv) params.set("statuses", statusCsv);
+      if (targetType) params.set("resourceType", targetType);
+      if (isPinnedParam) params.set("isPinned", isPinnedParam);
+
+      if (safeQuery) {
+        endpoint = "/api/search";
+        params.set("q", safeQuery);
+        params.set("mode", "hybrid");
+        params.set("sort", "relevance");
+        params.set("debug", "false");
+        params.set("log", "false");
+      }
+
+      const res = await fetch(`${endpoint}?${params.toString()}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data?.message || "목록 조회 실패");
-      setRecent(data);
+      setRecent(safeQuery ? normalizeResourceSearchItems(data?.items) : (data?.items || []));
+      setResourcePage(data?.page ?? safePage);
+      setResourceTotal(data?.total ?? 0);
+      setResourceTotalPages(data?.totalPages ?? 0);
     } catch (err) {
       setRecent([]);
+      setResourceTotal(0);
+      setResourceTotalPages(0);
+      setResourceError(err.message);
     } finally {
       setRecentLoading(false);
     }
   };
 
+  const fetchUploadingDocs = async () => {
+    setUploadingLoading(true);
+    setUploadingError(null);
+    try {
+      const res = await fetch("/api/ingest/recent?limit=50");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.message || "업로드 목록 조회 실패");
+
+      const activeDocs = (data || []).filter(
+        (item) =>
+          item?.resourceType === "document" &&
+          (item?.status === "queued" || item?.status === "processing")
+      );
+      setUploadingDocs(activeDocs);
+    } catch (err) {
+      setUploadingDocs([]);
+      setUploadingError(err.message);
+    } finally {
+      setUploadingLoading(false);
+    }
+  };
+
   useEffect(() => {
-    fetchRecent();
-    const timer = setInterval(fetchRecent, 5000);
+    if (workspace !== "resources") return undefined;
+
+    fetchRecent(
+      resourcePage,
+      resourceStatusFilter,
+      resourceTypeFilter,
+      resourcePinnedFilter,
+      resourceSearchQuery
+    );
+    if (resourceSearchActive) return undefined;
+
+    const timer = setInterval(() => {
+      fetchRecent(
+        resourcePage,
+        resourceStatusFilter,
+        resourceTypeFilter,
+        resourcePinnedFilter,
+        resourceSearchQuery
+      );
+    }, 5000);
     return () => clearInterval(timer);
-  }, []);
+  }, [workspace, resourcePage, resourceStatusFilter, resourceTypeFilter, resourcePinnedFilter, resourceSearchQuery]);
+
+  useEffect(() => {
+    if (workspace !== "upload") return undefined;
+
+    fetchUploadingDocs();
+    const timer = setInterval(() => {
+      fetchUploadingDocs();
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [workspace]);
+
+  useEffect(() => {
+    if (!resourceDetailOpen) return;
+    const onKeyDown = (event) => {
+      if (event.key !== "Escape") return;
+      closeResourceDetail();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [resourceDetailOpen]);
+
+  useEffect(() => {
+    if (!resourceFilterOpen) return undefined;
+    const onMouseDown = (event) => {
+      if (resourceFilterRef.current?.contains(event.target)) return;
+      setResourceFilterOpen(false);
+    };
+    const onKeyDown = (event) => {
+      if (event.key !== "Escape") return;
+      setResourceFilterOpen(false);
+    };
+    window.addEventListener("mousedown", onMouseDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("mousedown", onMouseDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [resourceFilterOpen]);
+
+  useEffect(() => {
+    if (statusMenuResourceId === null) return undefined;
+    const onMouseDown = (event) => {
+      if (!(event.target instanceof Element)) return;
+      if (event.target.closest(".status-dot-menu-wrap")) return;
+      setStatusMenuResourceId(null);
+    };
+    const onKeyDown = (event) => {
+      if (event.key !== "Escape") return;
+      setStatusMenuResourceId(null);
+    };
+    window.addEventListener("mousedown", onMouseDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("mousedown", onMouseDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [statusMenuResourceId]);
+
+  useEffect(() => {
+    if (!resourceEditOpen) return undefined;
+    const onKeyDown = (event) => {
+      if (event.key !== "Escape" || resourceEditSaving) return;
+      setResourceEditOpen(false);
+      setResourceEditForm(emptyResourceEditForm);
+      setResourceEditError(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [resourceEditOpen, resourceEditSaving]);
+
+  useEffect(() => {
+    if (!memoViewer) return undefined;
+    const onKeyDown = (event) => {
+      if (event.key !== "Escape") return;
+      setMemoViewer(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [memoViewer]);
 
   const fetchDetail = async (resourceId) => {
     setDetailLoading(true);
@@ -194,7 +485,105 @@ export default function App() {
     }
   };
 
+  const openResourceDetail = (resourceId) => {
+    setResourceDetailOpen(true);
+    setSelected(null);
+    setStatusMenuResourceId(null);
+    fetchDetail(resourceId);
+  };
+
+  const closeResourceDetail = () => {
+    setResourceDetailOpen(false);
+    setSelected(null);
+    setStatusMenuResourceId(null);
+  };
+
+  const openResourceEdit = (item) => {
+    setResourceEditForm(toEditForm(item));
+    setResourceEditError(null);
+    setResourceEditOpen(true);
+    setStatusMenuResourceId(null);
+  };
+
+  const closeResourceEdit = () => {
+    if (resourceEditSaving) return;
+    setResourceEditOpen(false);
+    setResourceEditForm(emptyResourceEditForm);
+    setResourceEditError(null);
+  };
+
+  const requestResourcePatch = async (resourceId, payload, fallbackMessage) => {
+    const res = await fetch(`/api/resources/${resourceId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.message || fallbackMessage);
+    }
+    return data;
+  };
+
+  const saveResourceEdit = async (event) => {
+    event.preventDefault();
+    if (!resourceEditForm?.resourceId) return;
+
+    const safeTitle = resourceEditForm.title.trim();
+    if (!safeTitle) {
+      setResourceEditError("제목을 입력해 주세요.");
+      return;
+    }
+
+    if (resourceEditForm.type === "link" && !resourceEditForm.url.trim()) {
+      setResourceEditError("URL을 입력해 주세요.");
+      return;
+    }
+
+    setResourceEditSaving(true);
+    setResourceEditError(null);
+    setResourceError(null);
+
+    const payload = {
+      title: safeTitle,
+      memo: resourceEditForm.memo,
+      tags: parseTagsInput(resourceEditForm.tags),
+      status: resourceEditForm.status,
+      isPinned: resourceEditForm.isPinned
+    };
+    if (resourceEditForm.type === "link") {
+      payload.url = resourceEditForm.url.trim();
+    }
+
+    try {
+      const data = await requestResourcePatch(
+        resourceEditForm.resourceId,
+        payload,
+        "수정 저장 실패"
+      );
+      mergeUpdatedResource(resourceEditForm.resourceId, data);
+      setResourceEditOpen(false);
+      setResourceEditForm(emptyResourceEditForm);
+      setStatusMenuResourceId(null);
+
+      fetchRecent(
+        resourcePage,
+        resourceStatusFilter,
+        resourceTypeFilter,
+        resourcePinnedFilter,
+        resourceSearchQuery
+      );
+    } catch (err) {
+      setResourceEditError(err.message);
+    } finally {
+      setResourceEditSaving(false);
+    }
+  };
+
   const cancelIngest = async (resourceId) => {
+    const ok = window.confirm("이 업로드를 중단할까요?");
+    if (!ok) return;
+
     setDetailLoading(true);
     try {
       const res = await fetch(`/api/ingest/${resourceId}/cancel`, {
@@ -204,6 +593,7 @@ export default function App() {
       if (!res.ok) throw new Error(data?.message || "취소 실패");
       setSelected(data);
       fetchRecent();
+      fetchUploadingDocs();
     } catch (err) {
       setSelected({ error: err.message });
     } finally {
@@ -221,6 +611,7 @@ export default function App() {
       if (!res.ok) throw new Error(data?.message || "재시도 실패");
       setSelected(data);
       fetchRecent();
+      fetchUploadingDocs();
     } catch (err) {
       setSelected({ error: err.message });
     } finally {
@@ -241,12 +632,146 @@ export default function App() {
         throw new Error(data?.message || "삭제 실패");
       }
       setSelected(null);
+      setResourceDetailOpen(false);
       fetchRecent();
+      fetchUploadingDocs();
     } catch (err) {
       setSelected({ error: err.message });
     } finally {
       setDetailLoading(false);
     }
+  };
+
+  const updateResourceStatus = async (resourceId, nextStatus) => {
+    if (statusUpdatingId === resourceId) return;
+    setStatusUpdatingId(resourceId);
+    setResourceError(null);
+    try {
+      const data = await requestResourcePatch(
+        resourceId,
+        { status: nextStatus },
+        "상태 변경 실패"
+      );
+      mergeUpdatedResource(resourceId, data);
+      setStatusMenuResourceId(null);
+
+      fetchRecent(
+        resourcePage,
+        resourceStatusFilter,
+        resourceTypeFilter,
+        resourcePinnedFilter,
+        resourceSearchQuery
+      );
+    } catch (err) {
+      setResourceError(err.message);
+    } finally {
+      setStatusUpdatingId(null);
+    }
+  };
+
+  const updateResourcePinned = async (resourceId, nextPinned) => {
+    if (statusUpdatingId === resourceId) return;
+    setStatusUpdatingId(resourceId);
+    setResourceError(null);
+    try {
+      const data = await requestResourcePatch(
+        resourceId,
+        { isPinned: nextPinned },
+        "중요 표시 변경 실패"
+      );
+      mergeUpdatedResource(resourceId, data);
+      setStatusMenuResourceId(null);
+      fetchRecent(
+        resourcePage,
+        resourceStatusFilter,
+        resourceTypeFilter,
+        resourcePinnedFilter,
+        resourceSearchQuery
+      );
+    } catch (err) {
+      setResourceError(err.message);
+    } finally {
+      setStatusUpdatingId(null);
+    }
+  };
+
+  const switchResourceStatusFilter = (nextStatus) => {
+    if (nextStatus === resourceStatusFilter) return;
+    setResourceStatusFilter(nextStatus);
+    setResourcePage(0);
+    setSelected(null);
+    setResourceDetailOpen(false);
+    setResourceEditOpen(false);
+    setResourceEditForm(emptyResourceEditForm);
+    setResourceEditError(null);
+    setResourceFilterOpen(false);
+    setStatusMenuResourceId(null);
+  };
+
+  const switchResourceTypeFilter = (nextType) => {
+    if (nextType === resourceTypeFilter) return;
+    setResourceTypeFilter(nextType);
+    setResourcePage(0);
+    setSelected(null);
+    setResourceDetailOpen(false);
+    setResourceEditOpen(false);
+    setResourceEditForm(emptyResourceEditForm);
+    setResourceEditError(null);
+    setResourceFilterOpen(false);
+    setStatusMenuResourceId(null);
+  };
+
+  const switchResourcePinnedFilter = (nextPinned) => {
+    if (nextPinned === resourcePinnedFilter) return;
+    setResourcePinnedFilter(nextPinned);
+    setResourcePage(0);
+    setSelected(null);
+    setResourceDetailOpen(false);
+    setResourceEditOpen(false);
+    setResourceEditForm(emptyResourceEditForm);
+    setResourceEditError(null);
+    setResourceFilterOpen(false);
+    setStatusMenuResourceId(null);
+  };
+
+  const submitResourceSearch = (event) => {
+    event.preventDefault();
+    const nextQuery = resourceSearchInput.trim();
+    if (nextQuery === resourceSearchQuery && resourcePage === 0) return;
+    setResourceSearchQuery(nextQuery);
+    setResourcePage(0);
+    setSelected(null);
+    setResourceDetailOpen(false);
+    setResourceEditOpen(false);
+    setResourceEditForm(emptyResourceEditForm);
+    setResourceEditError(null);
+    setStatusMenuResourceId(null);
+  };
+
+  const clearResourceSearch = () => {
+    if (!resourceSearchInput && !resourceSearchQuery) return;
+    setResourceSearchInput("");
+    setResourceSearchQuery("");
+    setResourcePage(0);
+    setSelected(null);
+    setResourceDetailOpen(false);
+    setResourceEditOpen(false);
+    setResourceEditForm(emptyResourceEditForm);
+    setResourceEditError(null);
+    setStatusMenuResourceId(null);
+  };
+
+  const moveResourcePage = (delta) => {
+    const nextPage = resourcePage + delta;
+    if (nextPage < 0) return;
+    if (resourceTotalPages > 0 && nextPage >= resourceTotalPages) return;
+    setResourcePage(nextPage);
+    setResourceDetailOpen(false);
+    setResourceEditOpen(false);
+    setResourceEditForm(emptyResourceEditForm);
+    setResourceEditError(null);
+    setSelected(null);
+    setStatusMenuResourceId(null);
   };
 
   const onDocChange = (key) => (e) => {
@@ -291,6 +816,7 @@ export default function App() {
       setResult(data);
       setDoc(defaultDoc);
       fetchRecent();
+      fetchUploadingDocs();
     } catch (err) {
       setResult({ error: err.message });
     } finally {
@@ -419,16 +945,50 @@ export default function App() {
     window.open(item.url, "_blank", "noopener,noreferrer");
   };
 
+  const openResourceSource = (item) => {
+    if (!item) return;
+    if (item.type === "link") {
+      openLinkSource(item);
+      return;
+    }
+    if (item.type === "document") {
+      openDocumentViewer(item, { query: "" });
+    }
+  };
+
+  const openMemoViewer = (item) => {
+    if (!item?.memo) return;
+    setMemoViewer({
+      title: item.title || "(제목 없음)",
+      memo: item.memo
+    });
+  };
+
+  const closeMemoViewer = () => {
+    setMemoViewer(null);
+  };
+
+  const onResourceItemClick = (event, item) => {
+    if (event?.target instanceof Element) {
+      const blocked = event.target.closest(
+        "button, a, input, textarea, select, .status-dot-menu, .resource-item-memo"
+      );
+      if (blocked) return;
+    }
+    loadResourceContent(item);
+  };
+
   const loadResourceContent = async (item) => {
     setContentTarget(item);
     setContentLoading(true);
     setContentError(null);
     setContentResult(emptyResourceContent);
-    setContentTab("matched");
+    const activeQuery = (workspace === "resources" ? resourceSearchQuery : search.q)?.trim() || "";
+    setContentTab(activeQuery ? "matched" : "all");
 
     const params = new URLSearchParams();
-    if (search.q?.trim()) {
-      params.set("q", search.q.trim());
+    if (activeQuery) {
+      params.set("q", activeQuery);
     }
 
     const queryString = params.toString();
@@ -490,7 +1050,7 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (workspace === "search") return;
+    if (workspace === "search" || workspace === "resources") return;
     setContentTarget(null);
     setContentResult(emptyResourceContent);
     setContentError(null);
@@ -532,11 +1092,19 @@ export default function App() {
       <header className="hero">
         <div className="hero-copy">
           <span className="pill">Collecta Workbench</span>
-          <h1>{workspace === "upload" ? "자료 업로드" : "검색 워크벤치"}</h1>
+          <h1>
+            {workspace === "upload"
+              ? "자료 업로드"
+              : workspace === "resources"
+                ? "전체 자료"
+                : "검색 워크벤치"}
+          </h1>
           <p>
             {workspace === "upload"
-              ? "문서와 링크를 등록하고 진행 상태를 확인하세요."
-              : "키워드, 시맨틱, 하이브리드 검색을 비교하면서 결과를 점검하세요."}
+              ? "문서와 링크를 등록하세요."
+              : workspace === "resources"
+                ? "필터에서 상태와 타입을 조합해 원하는 자료만 빠르게 확인하세요."
+                : "키워드, 시맨틱, 하이브리드 검색을 비교하면서 결과를 점검하세요."}
           </p>
         </div>
         <div className="hero-tabs workspace-tabs">
@@ -547,6 +1115,12 @@ export default function App() {
             업로드
           </button>
           <button
+            className={workspace === "resources" ? "active" : ""}
+            onClick={() => setWorkspace("resources")}
+          >
+            자료
+          </button>
+          <button
             className={workspace === "search" ? "active" : ""}
             onClick={() => setWorkspace("search")}
           >
@@ -555,8 +1129,8 @@ export default function App() {
         </div>
       </header>
 
-      {workspace === "upload" ? (
-        <section className="grid">
+      {workspace === "upload" && (
+        <section className="stack">
           <div className="stack">
             <div className="hero-tabs upload-tabs">
               <button
@@ -694,63 +1268,414 @@ export default function App() {
                 )}
               </div>
             )}
-          </div>
 
+            <section className="card list playful-card">
+              <div className="list-header">
+                <h2>업로드 중 문서</h2>
+                <div className="actions">
+                  <span className="hint">자동 갱신 5초</span>
+                  <button type="button" onClick={fetchUploadingDocs} disabled={uploadingLoading}>
+                    {uploadingLoading ? "갱신 중..." : "새로고침"}
+                  </button>
+                </div>
+              </div>
+              {uploadingError && <p className="error-msg">{uploadingError}</p>}
+              {!uploadingError && uploadingDocs.length === 0 ? (
+                <p className="muted">업로드 중인 문서가 없습니다.</p>
+              ) : (
+                <ul className="list-items">
+                  {uploadingDocs.map((item) => (
+                    <li key={item.resourceId} className={`status ${item.status}`}>
+                      <div>
+                        <strong>{item.title || "(제목 없음)"}</strong>
+                        <span className="meta">
+                          #{item.resourceId} · {statusLabel(item.status)}
+                        </span>
+                      </div>
+                      <div className="right">
+                        <span className="badge">{statusLabel(item.status)}</span>
+                        {item.stage && <span className="stage">{stageLabel(item.stage)}</span>}
+                        <button
+                          type="button"
+                          className="ghost compact"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            cancelIngest(item.resourceId);
+                          }}
+                          disabled={detailLoading}
+                        >
+                          중단
+                        </button>
+                      </div>
+                      {item.totalUnits ? (
+                        <div className="progress">
+                          <div
+                            className="bar"
+                            style={{
+                              width: `${progressPercent(item.processedUnits || 0, item.totalUnits)}%`
+                            }}
+                          />
+                          <span className="progress-text">
+                            {item.processedUnits || 0}/{item.totalUnits}
+                          </span>
+                        </div>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          </div>
+        </section>
+      )}
+
+      {workspace === "resources" && (
+        <section className="stack resources-page">
           <section className="card list playful-card">
-            <div className="list-header">
-              <h2>최근 업로드</h2>
-              <div className="actions">
-                <span className="hint">자동 갱신 5초</span>
-                <button type="button" onClick={fetchRecent} disabled={recentLoading}>
-                  {recentLoading ? "갱신 중..." : "새로고침"}
-                </button>
+            <div className="list-header resources-list-header">
+              <h2>자료 목록</h2>
+              <div className="list-header-right">
+                <div className="actions">
+                  <span className="hint">{resourceSearchActive ? "검색 결과 고정" : "자동 갱신 5초"}</span>
+                  <div className="resource-filter-wrap" ref={resourceFilterRef}>
+                    <button
+                      type="button"
+                      className={`resource-filter-trigger${resourceFilterOpen ? " active" : ""}`}
+                      onClick={() => setResourceFilterOpen((prev) => !prev)}
+                      aria-expanded={resourceFilterOpen}
+                      aria-haspopup="true"
+                    >
+                      필터
+                      <span className="resource-filter-current">
+                        {resourceStatusFilterLabel(resourceStatusFilter)} ·{" "}
+                        {resourceTypeFilterLabel(resourceTypeFilter)} ·{" "}
+                        {resourcePinnedFilterLabel(resourcePinnedFilter)}
+                      </span>
+                    </button>
+                    {resourceFilterOpen && (
+                      <div className="resource-filter-popover">
+                        <div className="resource-filter-section">
+                          <span className="resource-filter-title">상태</span>
+                          <div className="resource-filter-options">
+                            <button
+                              type="button"
+                              className={resourceStatusFilter === "active" ? "active" : ""}
+                              onClick={() => switchResourceStatusFilter("active")}
+                            >
+                              할 일/진행중
+                            </button>
+                            <button
+                              type="button"
+                              className={resourceStatusFilter === "todo" ? "active" : ""}
+                              onClick={() => switchResourceStatusFilter("todo")}
+                            >
+                              할 일
+                            </button>
+                            <button
+                              type="button"
+                              className={resourceStatusFilter === "in_progress" ? "active" : ""}
+                              onClick={() => switchResourceStatusFilter("in_progress")}
+                            >
+                              진행중
+                            </button>
+                            <button
+                              type="button"
+                              className={resourceStatusFilter === "done" ? "active" : ""}
+                              onClick={() => switchResourceStatusFilter("done")}
+                            >
+                              완료
+                            </button>
+                            <button
+                              type="button"
+                              className={resourceStatusFilter === "all" ? "active" : ""}
+                              onClick={() => switchResourceStatusFilter("all")}
+                            >
+                              전체 자료
+                            </button>
+                          </div>
+                        </div>
+                        <div className="resource-filter-section">
+                          <span className="resource-filter-title">타입</span>
+                          <div className="resource-filter-options">
+                            <button
+                              type="button"
+                              className={resourceTypeFilter === "" ? "active" : ""}
+                              onClick={() => switchResourceTypeFilter("")}
+                            >
+                              전체 타입
+                            </button>
+                            <button
+                              type="button"
+                              className={resourceTypeFilter === "document" ? "active" : ""}
+                              onClick={() => switchResourceTypeFilter("document")}
+                            >
+                              문서
+                            </button>
+                            <button
+                              type="button"
+                              className={resourceTypeFilter === "link" ? "active" : ""}
+                              onClick={() => switchResourceTypeFilter("link")}
+                            >
+                              링크
+                            </button>
+                          </div>
+                        </div>
+                        <div className="resource-filter-section">
+                          <span className="resource-filter-title">중요 표시</span>
+                          <div className="resource-filter-options">
+                            <button
+                              type="button"
+                              className={resourcePinnedFilter === "all" ? "active" : ""}
+                              onClick={() => switchResourcePinnedFilter("all")}
+                            >
+                              전체
+                            </button>
+                            <button
+                              type="button"
+                              className={resourcePinnedFilter === "pinned" ? "active" : ""}
+                              onClick={() => switchResourcePinnedFilter("pinned")}
+                            >
+                              중요만
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      fetchRecent(
+                        resourcePage,
+                        resourceStatusFilter,
+                        resourceTypeFilter,
+                        resourcePinnedFilter,
+                        resourceSearchQuery
+                      )}
+                    disabled={recentLoading}
+                  >
+                    {recentLoading ? "갱신 중..." : "새로고침"}
+                  </button>
+                </div>
+
               </div>
             </div>
-            {recent.length === 0 ? (
-              <p className="muted">최근 업로드가 없습니다.</p>
+
+            <div className="list-summary list-summary-with-search">
+              <div className="list-summary-meta">
+                <span>총 {resourceTotal}건</span>
+                <span>페이지 {resourceTotal === 0 ? 0 : resourcePage + 1}/{resourceTotalPages || 0}</span>
+                <span>
+                  필터 {resourceStatusFilterLabel(resourceStatusFilter)} ·{" "}
+                  {resourceTypeFilterLabel(resourceTypeFilter)} ·{" "}
+                  {resourcePinnedFilterLabel(resourcePinnedFilter)}
+                </span>
+              </div>
+              <form className="resource-quick-search" onSubmit={submitResourceSearch}>
+                <div className="resource-search-input-wrap">
+                  <input
+                    value={resourceSearchInput}
+                    onChange={(event) => setResourceSearchInput(event.target.value)}
+                    placeholder="자료 검색어 입력 (하이브리드)"
+                  />
+                  {(resourceSearchInput || resourceSearchActive) && (
+                    <button
+                      type="button"
+                      className="resource-search-clear"
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={clearResourceSearch}
+                      aria-label="검색어 지우기"
+                      title="검색어 지우기"
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+                <button type="submit" className="ghost compact" disabled={recentLoading}>
+                  검색
+                </button>
+              </form>
+            </div>
+
+            {resourceError && <p className="error-msg">{resourceError}</p>}
+
+            {!resourceError && recent.length === 0 ? (
+              <p className="muted">
+                {resourceSearchActive
+                  ? `"${resourceSearchQuery}" 검색 결과가 없습니다.`
+                  : resourceStatusFilter === "all"
+                    ? "자료가 없습니다."
+                    : `${resourceStatusFilterLabel(resourceStatusFilter)} 자료가 없습니다.`}
+              </p>
             ) : (
               <ul className="list-items">
                 {recent.map((item) => (
                   <li
                     key={item.resourceId}
-                    className={`status ${item.status}`}
-                    onClick={() => fetchDetail(item.resourceId)}
-                    role="button"
-                    tabIndex={0}
+                    className={`status resource-item ${item.status}${item.isPinned ? " pinned" : ""}`}
+                    onClick={(event) => onResourceItemClick(event, item)}
                   >
-                    <div>
-                      <strong>{item.title || "(제목 없음)"}</strong>
-                      <span className="meta">
-                        #{item.resourceId} · {item.resourceType}
-                      </span>
-                    </div>
-                    <div className="right">
-                      <span className="badge">{statusLabel(item.status)}</span>
-                      {item.stage && (
-                        <span className="stage">{stageLabel(item.stage)}</span>
-                      )}
-                      {item.errorMessage && <span className="error-msg">{item.errorMessage}</span>}
-                    </div>
-                    {item.totalUnits ? (
-                      <div className="progress">
-                        <div
-                          className="bar"
-                          style={{
-                            width: `${progressPercent(item.processedUnits || 0, item.totalUnits)}%`
-                          }}
-                        />
-                        <span className="progress-text">
-                          {item.processedUnits || 0}/{item.totalUnits}
+                    <div className="resource-item-body">
+                      <div className="resource-item-head">
+                        <div className="resource-item-title-group">
+                          <div className="status-dot-menu-wrap">
+                            <button
+                              type="button"
+                              className={`status-dot status-dot-button ${item.status}`}
+                              title={`상태 변경 (${statusLabel(item.status)})`}
+                              aria-label={`상태 변경 (${statusLabel(item.status)})`}
+                              onClick={() =>
+                                setStatusMenuResourceId((prev) =>
+                                  prev === item.resourceId ? null : item.resourceId
+                                )}
+                              disabled={statusUpdatingId === item.resourceId}
+                            />
+                            {statusMenuResourceId === item.resourceId && (
+                              <div className="status-dot-menu">
+                                <button
+                                  type="button"
+                                  className={item.status === "todo" ? "active" : ""}
+                                  onClick={() => updateResourceStatus(item.resourceId, "todo")}
+                                  disabled={statusUpdatingId === item.resourceId}
+                                >
+                                  할 일
+                                </button>
+                                <button
+                                  type="button"
+                                  className={item.status === "in_progress" ? "active" : ""}
+                                  onClick={() => updateResourceStatus(item.resourceId, "in_progress")}
+                                  disabled={statusUpdatingId === item.resourceId}
+                                >
+                                  진행중
+                                </button>
+                                <button
+                                  type="button"
+                                  className={item.status === "done" ? "active" : ""}
+                                  onClick={() => updateResourceStatus(item.resourceId, "done")}
+                                  disabled={statusUpdatingId === item.resourceId}
+                                >
+                                  완료
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            className={`pin-toggle${item.isPinned ? " active" : ""}`}
+                            title={item.isPinned ? "중요 해제" : "중요 표시"}
+                            aria-label={item.isPinned ? "중요 해제" : "중요 표시"}
+                            onClick={() => updateResourcePinned(item.resourceId, !item.isPinned)}
+                            disabled={statusUpdatingId === item.resourceId}
+                          >
+                            {item.isPinned ? "★" : "☆"}
+                          </button>
+                          <button
+                            type="button"
+                            className="resource-title-link"
+                            onClick={() => openResourceSource(item)}
+                            disabled={item.type === "link" && !item.url}
+                            title={item.type === "document" ? "원본 자료 열기" : "원본 링크 열기"}
+                          >
+                            {item.title || "(제목 없음)"}
+                          </button>
+                          {item.tags?.length > 0 && (
+                            <span className="resource-tags-inline">
+                              tags: {item.tags.join(", ")}
+                            </span>
+                          )}
+                        </div>
+                        <span className="resource-item-meta-inline">
+                          #{item.resourceId} · {item.type}
                         </span>
                       </div>
-                    ) : null}
+                      <div className="resource-item-row">
+                        {item.memo ? (
+                          <p
+                            className="resource-item-memo"
+                            title="클릭해 전체 메모 보기"
+                            onClick={() => openMemoViewer(item)}
+                          >
+                            {item.memo}
+                          </p>
+                        ) : (
+                          <span className="resource-item-memo-empty" />
+                        )}
+                        {resourceSearchActive && (
+                          <span className="resource-item-search-meta">
+                            score {formatScore(item.bestScore)} · match {item.matchCount ?? 0}
+                          </span>
+                        )}
+                        <div className="resource-item-actions">
+                          <div className="resource-item-action-buttons">
+                            <button
+                              type="button"
+                              className="ghost compact"
+                              onClick={() => openResourceEdit(item)}
+                            >
+                              수정
+                            </button>
+                            <button
+                              type="button"
+                              className="ghost compact"
+                              onClick={() => openResourceDetail(item.resourceId)}
+                            >
+                              상세 보기
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
                   </li>
                 ))}
               </ul>
             )}
 
-            <div className="detail">
+            <div className="pager">
+              <button
+                type="button"
+                className="ghost"
+                onClick={() => moveResourcePage(-1)}
+                disabled={recentLoading || resourcePage <= 0}
+              >
+                이전
+              </button>
+              <button
+                type="button"
+                className="ghost"
+                onClick={() => moveResourcePage(1)}
+                disabled={
+                  recentLoading ||
+                  resourceTotalPages === 0 ||
+                  resourcePage >= resourceTotalPages - 1
+                }
+              >
+                다음
+              </button>
+            </div>
+          </section>
+        </section>
+      )}
+
+      {workspace === "resources" && resourceDetailOpen && (
+        <div
+          className="resource-detail-backdrop"
+          onClick={closeResourceDetail}
+          role="presentation"
+        >
+          <section
+            className="resource-detail-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="자료 상세"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="resource-detail-head">
               <h3>상세</h3>
+              <button type="button" className="ghost" onClick={closeResourceDetail}>
+                닫기
+              </button>
+            </div>
+            <div className="resource-detail-body">
               {detailLoading && <p className="muted">불러오는 중...</p>}
               {!detailLoading && !selected && (
                 <p className="muted">항목을 클릭하면 상세를 보여줍니다.</p>
@@ -840,8 +1765,148 @@ export default function App() {
               )}
             </div>
           </section>
-        </section>
-      ) : (
+        </div>
+      )}
+
+      {workspace === "resources" && resourceEditOpen && (
+        <div
+          className="resource-edit-backdrop"
+          onClick={closeResourceEdit}
+          role="presentation"
+        >
+          <section
+            className="resource-edit-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="자료 수정"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="resource-edit-head">
+              <h3>자료 수정</h3>
+              <button
+                type="button"
+                className="ghost"
+                onClick={closeResourceEdit}
+                disabled={resourceEditSaving}
+              >
+                닫기
+              </button>
+            </div>
+            <form className="resource-edit-body" onSubmit={saveResourceEdit}>
+              {resourceEditError && <p className="error-msg">{resourceEditError}</p>}
+              <div className="row">
+                <label>제목</label>
+                <input
+                  value={resourceEditForm.title}
+                  onChange={(event) =>
+                    setResourceEditForm((prev) => ({ ...prev, title: event.target.value }))
+                  }
+                  disabled={resourceEditSaving}
+                />
+              </div>
+              <div className="row">
+                <label>메모</label>
+                <textarea
+                  value={resourceEditForm.memo}
+                  onChange={(event) =>
+                    setResourceEditForm((prev) => ({ ...prev, memo: event.target.value }))
+                  }
+                  disabled={resourceEditSaving}
+                />
+              </div>
+              <div className="row">
+                <label>태그 (쉼표 구분)</label>
+                <input
+                  value={resourceEditForm.tags}
+                  onChange={(event) =>
+                    setResourceEditForm((prev) => ({ ...prev, tags: event.target.value }))
+                  }
+                  disabled={resourceEditSaving}
+                />
+              </div>
+              <div className="row inline">
+                <label>상태</label>
+                <select
+                  value={resourceEditForm.status}
+                  onChange={(event) =>
+                    setResourceEditForm((prev) => ({ ...prev, status: event.target.value }))
+                  }
+                  disabled={resourceEditSaving}
+                >
+                  <option value="todo">할 일</option>
+                  <option value="in_progress">진행 중</option>
+                  <option value="done">완료</option>
+                </select>
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={resourceEditForm.isPinned}
+                    onChange={(event) =>
+                      setResourceEditForm((prev) => ({ ...prev, isPinned: event.target.checked }))
+                    }
+                    disabled={resourceEditSaving}
+                  />
+                  중요 표시
+                </label>
+              </div>
+              {resourceEditForm.type === "link" && (
+                <div className="row">
+                  <label>URL</label>
+                  <input
+                    value={resourceEditForm.url}
+                    onChange={(event) =>
+                      setResourceEditForm((prev) => ({ ...prev, url: event.target.value }))
+                    }
+                    disabled={resourceEditSaving}
+                  />
+                </div>
+              )}
+              <div className="resource-edit-actions">
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={closeResourceEdit}
+                  disabled={resourceEditSaving}
+                >
+                  취소
+                </button>
+                <button type="submit" disabled={resourceEditSaving}>
+                  {resourceEditSaving ? "저장 중..." : "저장"}
+                </button>
+              </div>
+            </form>
+          </section>
+        </div>
+      )}
+
+      {workspace === "resources" && memoViewer && (
+        <div
+          className="memo-viewer-backdrop"
+          onClick={closeMemoViewer}
+          role="presentation"
+        >
+          <section
+            className="memo-viewer-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="전체 메모"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="memo-viewer-head">
+              <h3>전체 메모</h3>
+              <button type="button" className="ghost" onClick={closeMemoViewer}>
+                닫기
+              </button>
+            </div>
+            <div className="memo-viewer-body">
+              <p className="meta">{memoViewer.title}</p>
+              <p className="memo-viewer-text">{memoViewer.memo}</p>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {workspace === "search" && (
         <section className="grid search-grid">
           <form className="card playful-card" onSubmit={submitSearch}>
             <div className="card-title">검색 조건</div>
@@ -1039,7 +2104,7 @@ export default function App() {
         </section>
       )}
 
-      {workspace === "search" && contentTarget && (
+      {(workspace === "search" || workspace === "resources") && contentTarget && (
         <div
           className="content-drawer-backdrop"
           onClick={closeContentViewer}
